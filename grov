@@ -115,6 +115,16 @@ cmd_init() {
   mkdir -p .dev/scripts
   git init --bare "$BARE_REPO"
   (cd "$root" && git remote add _dev_bare "$(pwd)/$BARE_REPO" && git push _dev_bare --all && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
+  # Copy remotes from original repo into bare so fetch/push still work
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    url=$(git -C "$root" config --get "remote.$name.url" 2>/dev/null)
+    [[ -z "$url" ]] && continue
+    git --git-dir="$root/$BARE_REPO" remote add "$name" "$url" 2>/dev/null || true
+    git -C "$root" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
+      [[ -n "$refspec" ]] && git --git-dir="$root/$BARE_REPO" config --add "remote.$name.fetch" "$refspec"
+    done
+  done < <(git -C "$root" remote 2>/dev/null)
   mkdir -p "$BRANCHES_DIR_NAME"
   git --git-dir="$root/$BARE_REPO" worktree add "$BRANCHES_DIR_NAME/$branch_dir" "$branch" 2>/dev/null || \
     git --git-dir="$root/$BARE_REPO" worktree add "$BRANCHES_DIR_NAME/$branch_dir" HEAD
