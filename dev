@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# Dev CLI: manage worktrees, linking, and build for src.
+#
+# Install: ln -sf /path/to/src/dev/dev ~/bin/dev  (ensure ~/bin is on PATH)
+# From outside src: export DEV_ROOT=~/src  in .bashrc so dev finds the root.
+# Usage: dev <command> [args...]
+#   checkout [-b] <branch>  create worktree (use -b to create branch from linked); runs build
+#   deploy [branch]          set git-bradlee-r -> branches/<branch> (branch from cwd or arg)
+#   build [branch]          composer install, do_release.py, touch last_commit in worktree
+#   status                  list worktrees and linked branch with git state
+#   remove <branch>         remove a worktree (does not delete the branch)
+
+set -e
+LINK_NAME="git-bradlee-r"
+BRANCHES_DIR_NAME="branches"
+MAIN_WORKTREE="master"
+
+find_dev_root() {
+  local d="$PWD"
+  while [[ -n "$d" && "$d" != "/" ]]; do
+    [[ -e "$d/.dev" ]] && echo "$d" && return 0
+    d="${d%/*}"
+  done
+  [[ -n "$DEV_ROOT" && -e "$DEV_ROOT/.dev" ]] && echo "$DEV_ROOT" && return 0
+  local script_path
+  script_path=$(readlink -f "$0" 2>/dev/null || true)
+  if [[ -n "$script_path" ]]; then
+    # Script is at DEV_ROOT/dev/dev
+    d=$(dirname "$script_path")
+    d=$(dirname "$d")
+    [[ -e "$d/.dev" ]] && echo "$d" && return 0
+  fi
+  return 1
+}
+
+get_linked_branch() {
+  local root=$1
+  local link_path
+  link_path=$(cd "$root" && pwd)/$LINK_NAME
+  if [[ ! -L "$link_path" ]]; then
+    echo ""; return 1
+  fi
+  local target
+  target=$(readlink -f "$link_path")
+  [[ -z "$target" ]] && echo "" && return 1
+  basename "$target"
+}
+
+get_current_branch_from_cwd() {
+  local root=$1
+  local branches="$root/$BRANCHES_DIR_NAME"
+  if [[ "$PWD" != "$branches"/* ]]; then
+    echo ""; return 1
+  fi
+  local rest="${PWD#$branches/}"
+  echo "${rest%%/*}"
+}
+
+get_worktree_path() {
+  echo "$1/$BRANCHES_DIR_NAME/$2"
+}
+
+list_branch_dirs() {
+  local root=$1
+  local dir="$root/$BRANCHES_DIR_NAME"
+  [[ ! -d "$dir" ]] && return 0
+  local d
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] && basename "$d"
+  done | sort
+}
+
+usage() {
+  echo "Usage: dev <checkout|deploy|build|status|remove> [args...]"
+  echo "  checkout [-b] <branch>  create worktree (use -b to create branch from linked); runs build"
+  echo "  deploy [branch]         set git-bradlee-r to branch (from cwd or arg)"
+  echo "  build [branch]          composer install, do_release.py, touch last_commit in worktree"
+  echo "  status                  list worktrees and linked branch with git state"
+  echo "  remove <branch>         remove a worktree (does not delete the branch)"
+  exit 1
+}
+
+cmd_checkout() {
+  local root=$1
+  shift
+  local create_branch=false
+  if [[ "$1" == "-b" ]]; then
+    create_branch=true
+    shift
+  fi
+  local branch="$1"
+  [[ -z "$branch" ]] && echo "Usage: dev checkout [-b] <branch>" && exit 1
+  local repo="$root/$BRANCHES_DIR_NAME/$MAIN_WORKTREE"
+  # Use absolute path so worktrees are never created inside another worktree (e.g. inside master)
+  local wt_path
+  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
+  if [[ ! -d "$repo/.git" ]]; then
+    echo "Error: Main worktree not found at $repo"
+    exit 1
+  fi
+  if [[ -d "$wt_path" ]]; then
+    echo "Error: Worktree already exists at $wt_path"
+    exit 1
+  fi
+
+  if [[ "$create_branch" == true ]]; then
+    local source_branch
+    source_branch=$(get_linked_branch "$root")
+    [[ -z "$source_branch" ]] && echo "Error: git-bradlee-r is not a symlink; cannot use -b without a linked branch." && exit 1
+    git -C "$repo" worktree add -b "$branch" "$wt_path" "$source_branch"
+    echo "Created branch '$branch' from '$source_branch' and worktree at $wt_path"
+  else
+    if ! git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
+      echo "Error: Branch '$branch' does not exist. Create it first or use: dev checkout -b <branch>"
+      exit 1
+    fi
+    git -C "$repo" worktree add "$wt_path" "$branch"
+    echo "Created worktree at $wt_path"
+  fi
+
+  echo "Running build in $wt_path..."
+  cmd_build "$root" "$branch"
+}
+
+cmd_deploy() {
+  local root=$1
+  shift
+  local branch="$1"
+  local branches_dir="$root/$BRANCHES_DIR_NAME"
+
+  if [[ -z "$branch" ]]; then
+    branch=$(get_current_branch_from_cwd "$root")
+    if [[ -z "$branch" ]]; then
+      echo "Run from inside a branch folder (e.g. branches/ddex-export) or pass branch: dev deploy <branch>" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ ! -d "$branches_dir/$branch" ]]; then
+    echo "Error: No worktree at $branches_dir/$branch" >&2
+    exit 1
+  fi
+
+  # Symlink at project root: use canonical absolute path so we always update the real git-bradlee-r
+  local link_path
+  link_path=$(cd "$root" && pwd)/$LINK_NAME
+  if [[ ! -e "$(dirname "$link_path")/.dev" ]]; then
+    echo "Error: Dev root missing .dev marker at $(dirname "$link_path")" >&2
+    exit 1
+  fi
+  ln -sfn "$BRANCHES_DIR_NAME/$branch" "$link_path"
+  echo "Linked $LINK_NAME -> $BRANCHES_DIR_NAME/$branch ($branch)"
+  echo "To follow in this shell: cd $link_path"
+  echo "(Source $root/dev/dev-completion.bash in .bashrc so 'dev deploy' does the cd for you.)"
+}
+
+cmd_build() {
+  local root=$1
+  local branch="${2:-}"
+  if [[ -z "$branch" ]]; then
+    branch=$(get_current_branch_from_cwd "$root")
+    if [[ -z "$branch" ]]; then
+      branch=$(get_linked_branch "$root")
+      if [[ -z "$branch" ]]; then
+        echo "Error: Not inside a branch folder and git-bradlee-r is not a symlink. Use: dev build <branch>" >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  local wt_path
+  wt_path=$(get_worktree_path "$root" "$branch")
+  wt_path=$(readlink -f "$wt_path" 2>/dev/null || true)
+  [[ -z "$wt_path" || ! -d "$wt_path" ]] && wt_path="$root/$BRANCHES_DIR_NAME/$branch"
+
+  if [[ ! -d "$wt_path" ]]; then
+    echo "Error: Worktree does not exist: $wt_path" >&2
+    exit 1
+  fi
+  if [[ ! -f "$wt_path/composer.json" ]]; then
+    echo "Error: composer.json not found in $wt_path" >&2
+    exit 1
+  fi
+  if [[ ! -f "$wt_path/do_release.py" ]]; then
+    echo "Error: do_release.py not found in $wt_path" >&2
+    exit 1
+  fi
+
+  echo "Building branch: $branch ( $wt_path )"
+  ( cd "$wt_path" && \
+    composer install && \
+    python3 do_release.py && \
+    touch last_commit && \
+    echo "Build complete." )
+}
+
+cmd_remove() {
+  local root=$1
+  shift
+  local branch="$1"
+  [[ -z "$branch" ]] && echo "Usage: dev remove <branch>" >&2 && exit 1
+
+  local repo="$root/$BRANCHES_DIR_NAME/$MAIN_WORKTREE"
+  local wt_path
+  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
+
+  if [[ "$branch" == "$MAIN_WORKTREE" ]]; then
+    echo "Error: Cannot remove the main worktree (master)." >&2
+    exit 1
+  fi
+  if [[ ! -d "$wt_path" ]]; then
+    echo "Error: No worktree at $wt_path" >&2
+    exit 1
+  fi
+
+  git -C "$repo" worktree remove "$wt_path"
+  echo "Removed worktree: $branch"
+}
+
+cmd_status() {
+  local root=$1
+  local link_path="$root/$LINK_NAME"
+  local linked=""
+  if [[ -L "$link_path" ]]; then
+    linked=$(basename "$(readlink "$link_path")")
+  fi
+
+  echo "Linked: ${linked:-none}"
+  echo ""
+
+  local branch
+  while IFS= read -r branch; do
+    [[ -z "$branch" ]] && continue
+    local wt_path
+    wt_path=$(get_worktree_path "$root" "$branch")
+    [[ ! -d "$wt_path" ]] && continue
+
+    local marker=""
+    [[ "$branch" == "$linked" ]] && marker=" (linked)"
+
+    local state=""
+    if git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null; then
+      if [[ -n $(git -C "$wt_path" status -s 2>/dev/null) ]]; then
+        state="uncommitted"
+      else
+        local ahead behind
+        ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
+        behind=$(git -C "$wt_path" rev-list --count HEAD..@{u} 2>/dev/null || echo "0")
+        if [[ "$ahead" != "0" || "$behind" != "0" ]]; then
+          state="ahead $ahead, behind $behind"
+        else
+          state="clean"
+        fi
+      fi
+    else
+      state="?"
+    fi
+    echo "  $branch$marker  $state"
+  done < <(list_branch_dirs "$root")
+}
+
+# Main: resolve dev root
+_raw_root=$(find_dev_root) || {
+  echo "Error: Cannot find dev root (no .dev in path and DEV_ROOT not set)." >&2
+  exit 1
+}
+DEV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
+
+# Strip --shell so commands do not see it
+DEV_SHELL_MODE=
+args=()
+for a in "$@"; do
+  if [[ "$a" == "--shell" ]]; then
+    DEV_SHELL_MODE=1
+  else
+    args+=("$a")
+  fi
+done
+set -- "${args[@]}"
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  checkout)  cmd_checkout "$DEV_ROOT" "$@" ;;
+  build)     cmd_build "$DEV_ROOT" "$@" ;;
+  status)    cmd_status "$DEV_ROOT" "$@" ;;
+  remove)    cmd_remove "$DEV_ROOT" "$@" ;;
+  path)      cmd_path "$DEV_ROOT" ;;
+  "")        usage ;;
+  *)         echo "Unknown command: $cmd" >&2; usage ;;
+esac
