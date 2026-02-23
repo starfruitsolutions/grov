@@ -1,40 +1,42 @@
 #!/usr/bin/env bash
-# Install grov CLI: link grov into a dir on PATH; optionally add completion to ~/.bashrc.
-# Usage: ./install [BIN_DIR] [--bashrc]
-#   BIN_DIR  where to link grov (default: $HOME/bin, which is on PATH on many systems)
-#   --bashrc append completion source to ~/.bashrc if missing
+# Install grov CLI: copy grov and completion into a dir on PATH; optionally add completion to ~/.bashrc.
+# Usage: ./install [BIN_DIR]
+#   BIN_DIR  default: ~/.local/bin (common per-user location, usually already on PATH)
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="$HOME/bin"
-DO_BASHRC=false
-for arg in "$@"; do
-  if [[ "$arg" == "--bashrc" ]]; then
-    DO_BASHRC=true
-  else
-    BIN_DIR="$arg"
-  fi
-done
+BIN_DIR="${1:-$HOME/.local/bin}"
 
 mkdir -p "$BIN_DIR"
-ln -sfn "$SCRIPT_DIR/grov" "$BIN_DIR/grov"
+cp "$SCRIPT_DIR/grov" "$BIN_DIR/grov"
+chmod +x "$BIN_DIR/grov"
+if [[ -f "$SCRIPT_DIR/grov-completion.bash" ]]; then
+  cp "$SCRIPT_DIR/grov-completion.bash" "$BIN_DIR/grov-completion.bash"
+fi
 echo "Installed: $BIN_DIR/grov"
 
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo "Note: ensure $BIN_DIR is on your PATH (many systems add ~/bin by default)."
+  echo "Note: ensure $BIN_DIR is on your PATH (e.g. add to ~/.bashrc: export PATH=\"\$HOME/.local/bin:\$PATH\")."
 fi
 
 BASHRC="${BASHRC:-$HOME/.bashrc}"
-COMPLETION="$SCRIPT_DIR/grov-completion.bash"
-if [[ -f "$COMPLETION" ]]; then
-  if [[ "$DO_BASHRC" == true && -f "$BASHRC" ]]; then
-    if ! grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null; then
+COMPLETION="$BIN_DIR/grov-completion.bash"
+if [[ -f "$COMPLETION" && -f "$BASHRC" ]]; then
+  if grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null; then
+    :
+  else
+    echo -n "Add completions to ~/.bashrc? [y/N] "
+    read -r ans
+    if [[ "$ans" == [yY]* ]]; then
       echo "" >> "$BASHRC"
       echo "# grov completion" >> "$BASHRC"
-      echo "source $SCRIPT_DIR/grov-completion.bash" >> "$BASHRC"
+      echo "source $COMPLETION" >> "$BASHRC"
       echo "Added completion to $BASHRC"
+      echo -n "Run 'source ~/.bashrc' to enable now? [y/N] "
+      read -r ans2
+      if [[ "$ans2" == [yY]* ]]; then
+        source "$BASHRC"
+        echo "Done."
+      fi
     fi
-  else
-    echo "Add to your .bashrc for wrapper and completion:"
-    echo "  source $COMPLETION"
   fi
 fi

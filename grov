@@ -122,12 +122,15 @@ cmd_init() {
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   ln -sfn "$BRANCHES_DIR_NAME/$branch_dir" "$link_path"
   mkdir -p .dev/old-checkout
-  echo "Stub: previous working tree. Refs in .dev/repo.git; worktree at branches/$branch_dir" > .dev/old-checkout/README.txt
-  for f in .gitignore .env .env.local; do
-    [[ -e "$root/$f" ]] && cp -a "$root/$f" ".dev/old-checkout/$f" 2>/dev/null || true
+  (cd "$root" && git ls-files --others --exclude-standard) | while IFS= read -r f; do
+    [[ -n "$f" && -e "$root/$f" ]] || continue
+    mkdir -p "$root/.dev/old-checkout/$(dirname "$f")"
+    mv "$root/$f" "$root/.dev/old-checkout/$f"
   done
+  find "$root" -mindepth 1 -maxdepth 1 ! -name .dev ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
   rm -rf "$root/.git"
-  echo "Initialized. workspace -> branches/$branch_dir. Old checkout stub in .dev/old-checkout."
+  echo "Untracked files from previous working tree. Refs in .dev/repo.git; worktree at branches/$branch_dir" > "$root/.dev/old-checkout/README.txt"
+  echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .dev/old-checkout."
 }
 
 cmd_path() {
