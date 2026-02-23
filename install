@@ -1,16 +1,40 @@
 #!/usr/bin/env bash
-# Install grov CLI: link grov into a dir on PATH and optionally install bashrc snippet.
+# Install grov CLI: link grov into a dir on PATH; optionally add completion to ~/.bashrc.
+# Usage: ./install [BIN_DIR] [--bashrc]
+#   BIN_DIR  where to link grov (default: $HOME/bin, which is on PATH on many systems)
+#   --bashrc append completion source to ~/.bashrc if missing
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${1:-$HOME/bin}"
+BIN_DIR="$HOME/bin"
+DO_BASHRC=false
+for arg in "$@"; do
+  if [[ "$arg" == "--bashrc" ]]; then
+    DO_BASHRC=true
+  else
+    BIN_DIR="$arg"
+  fi
+done
+
 mkdir -p "$BIN_DIR"
 ln -sfn "$SCRIPT_DIR/grov" "$BIN_DIR/grov"
 echo "Installed: $BIN_DIR/grov"
+
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo "Add to your .bashrc: export PATH=\"$BIN_DIR:\$PATH\""
+  echo "Note: ensure $BIN_DIR is on your PATH (many systems add ~/bin by default)."
 fi
+
+BASHRC="${BASHRC:-$HOME/.bashrc}"
 COMPLETION="$SCRIPT_DIR/grov-completion.bash"
 if [[ -f "$COMPLETION" ]]; then
-  echo "Add to your .bashrc to enable wrapper and completion:"
-  echo "  source $COMPLETION"
+  if [[ "$DO_BASHRC" == true && -f "$BASHRC" ]]; then
+    if ! grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null; then
+      echo "" >> "$BASHRC"
+      echo "# grov completion" >> "$BASHRC"
+      echo "source $SCRIPT_DIR/grov-completion.bash" >> "$BASHRC"
+      echo "Added completion to $BASHRC"
+    fi
+  else
+    echo "Add to your .bashrc for wrapper and completion:"
+    echo "  source $COMPLETION"
+  fi
 fi
