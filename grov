@@ -84,8 +84,9 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: grov <init|checkout|build|status|remove|path> [args...]"
-  echo "  init                    convert current git repo to dev layout"
+  echo "Usage: grov <init|checkout|build|status|remove|path|restore> [args...]"
+  echo "  init                    convert current git repo to grov layout"
+  echo "  restore                 convert grov project back to normal git repo (linked branch at root)"
   echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build"
   echo "  build [branch]          composer install, do_release.py, touch last_commit in worktree"
   echo "  status                  list worktrees and linked branch with git state"
@@ -305,6 +306,32 @@ cmd_status() {
   done < <(list_branch_dirs "$root")
 }
 
+cmd_restore() {
+  local root=$1
+  if [[ ! -d "$root/$BARE_REPO" ]]; then
+    echo "Error: Not a grov project (no $BARE_REPO)." >&2
+    exit 1
+  fi
+  ensure_workspace "$root" || { echo "Error: No workspace linked." >&2; exit 1; }
+  local linked_dir
+  linked_dir=$(get_linked_branch "$root")
+  [[ -z "$linked_dir" ]] && { echo "Error: Could not get linked branch." >&2; exit 1; }
+  local linked_wt="$root/$BRANCHES_DIR_NAME/$linked_dir"
+  [[ ! -d "$linked_wt" ]] && { echo "Error: Worktree $linked_wt not found." >&2; exit 1; }
+  local linked_branch
+  linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || linked_branch="$MAIN_WORKTREE"
+  local tmp="$root/.grov-restore-tmp"
+  git clone --local "$root/$BARE_REPO" "$tmp" -b "$linked_branch" || {
+    echo "Error: Clone from bare failed." >&2
+    exit 1
+  }
+  rm -rf "$root/.dev" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
+  mv "$tmp/.git" "$root/.git"
+  (cd "$tmp" && shopt -s dotglob nullglob 2>/dev/null; for f in *; do [[ -n "$f" && "$f" != ".git" && -e "$f" ]] && mv "$f" "$root/$f"; done)
+  rm -rf "$tmp"
+  echo "Restored to normal git repo (branch $linked_branch at root)."
+}
+
 # Main: init does not require grov root
 cmd="${1:-}"
 shift || true
@@ -325,6 +352,7 @@ case "$cmd" in
   status)    cmd_status "$GROV_ROOT" "$@" ;;
   remove)    cmd_remove "$GROV_ROOT" "$@" ;;
   path)      cmd_path "$GROV_ROOT" ;;
+  restore)   cmd_restore "$GROV_ROOT" ;;
   "")
     usage
     ;;
