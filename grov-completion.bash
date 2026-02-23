@@ -89,7 +89,9 @@ _grov() {
     init) ;;
     checkout)
       if [[ $cword -eq 2 ]]; then
-        COMPREPLY=($(compgen -W "-b $(_grov_list_git_branches)" -- "$cur"))
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches) -b" -- "$cur"))
+      elif [[ $cword -eq 3 && "$prev" == "-b" ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       fi
       ;;
     build)

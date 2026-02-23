@@ -334,35 +334,46 @@ cmd_restore() {
   local linked_wt="$root/$BRANCHES_DIR_NAME/$linked_dir"
   [[ ! -d "$linked_wt" ]] && { echo "Error: Worktree $linked_wt not found." >&2; exit 1; }
   local primary_branch
-  primary_branch=$(cat "$root/.grov/primary-branch" 2>/dev/null)
+  primary_branch=$(cat "$root/.grov/primary-branch" 2>/dev/null) || true
   local linked_branch
-  linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || linked_branch="${primary_branch:-master}"
+  linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
+  [[ -z "$linked_branch" ]] && linked_branch="${primary_branch:-master}"
   local tmp="$root/.grov-restore-tmp"
   git clone --local "$root/$BARE_REPO" "$tmp" -b "$linked_branch" || {
     echo "Error: Clone from bare failed." >&2
     exit 1
   }
   # Point clone's remotes at the real URLs, not the removed bare repo (clone only has origin → bare path)
+  local bare="$root/$BARE_REPO"
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    url=$(git -C "$root/$BARE_REPO" config --get "remote.$name.url" 2>/dev/null)
+    url=$(git --git-dir="$bare" config --get "remote.$name.url" 2>/dev/null)
     [[ -z "$url" ]] && continue
     if [[ "$name" == "origin" ]]; then
       git -C "$tmp" remote set-url origin "$url"
     else
       git -C "$tmp" remote add "$name" "$url" 2>/dev/null || git -C "$tmp" remote set-url "$name" "$url"
-      git -C "$root/$BARE_REPO" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
+      git --git-dir="$bare" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
         [[ -n "$refspec" ]] && git -C "$tmp" config --add "remote.$name.fetch" "$refspec"
       done
     fi
-  done < <(git -C "$root/$BARE_REPO" remote 2>/dev/null)
-  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
-  # Clear any other root content (e.g. .vscode from opening root in editor) so mv from tmp doesn't nest duplicates
+  done < <(git --git-dir="$bare" remote 2>/dev/null)
+  # Leave root so rm can remove .grov, branches, workspace (rm may fail if cwd is inside them)
+  cd /tmp 2>/dev/null || cd "$root/.." || true
+  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME" || {
+    echo "Error: Failed to remove .grov, branches, or workspace." >&2
+    rm -rf "$tmp"
+    exit 1
+  }
+  # Clear any other root content so mv from tmp doesn't nest duplicates
   for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [[ -e "$f" && "$f" != "$tmp" ]] && rm -rf "$f"
   done
   mv "$tmp/.git" "$root/.git"
-  (cd "$tmp" && shopt -s dotglob nullglob 2>/dev/null; for f in *; do [[ -n "$f" && "$f" != ".git" && -e "$f" ]] && mv "$f" "$root/$f"; done)
+  (cd "$tmp" && shopt -s dotglob nullglob 2>/dev/null; for f in *; do
+    [[ -z "$f" || "$f" == ".git" ]] && continue
+    [[ -e "$f" ]] && mv "$f" "$root/$f"
+  done)
   rm -rf "$tmp"
   echo "Restored to normal git repo (branch $linked_branch at root)."
 }
