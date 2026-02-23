@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Install dev CLI: link dev into a dir on PATH and optionally install bashrc snippet.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="${1:-$HOME/bin}"
+mkdir -p "$BIN_DIR"
+ln -sfn "$SCRIPT_DIR/dev" "$BIN_DIR/dev"
+echo "Installed: $BIN_DIR/dev"
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+  echo "Add to your .bashrc: export PATH=\"$BIN_DIR:\$PATH\""
+fi
+COMPLETION="$SCRIPT_DIR/dev-completion.bash"
+if [[ -f "$COMPLETION" ]]; then
+  echo "Add to your .bashrc to enable wrapper and completion:"
+  echo "  source $COMPLETION"
+fi
