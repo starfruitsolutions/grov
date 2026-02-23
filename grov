@@ -325,6 +325,20 @@ cmd_restore() {
     echo "Error: Clone from bare failed." >&2
     exit 1
   }
+  # Point clone's remotes at the real URLs, not the removed bare repo (clone only has origin → bare path)
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    url=$(git -C "$root/$BARE_REPO" config --get "remote.$name.url" 2>/dev/null)
+    [[ -z "$url" ]] && continue
+    if [[ "$name" == "origin" ]]; then
+      git -C "$tmp" remote set-url origin "$url"
+    else
+      git -C "$tmp" remote add "$name" "$url" 2>/dev/null || git -C "$tmp" remote set-url "$name" "$url"
+      git -C "$root/$BARE_REPO" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
+        [[ -n "$refspec" ]] && git -C "$tmp" config --add "remote.$name.fetch" "$refspec"
+      done
+    fi
+  done < <(git -C "$root/$BARE_REPO" remote 2>/dev/null)
   rm -rf "$root/.dev" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
   # Clear any other root content (e.g. .vscode from opening root in editor) so mv from tmp doesn't nest duplicates
   for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
