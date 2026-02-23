@@ -1,35 +1,39 @@
 #!/usr/bin/env bash
-# Grov CLI: worktrees, workspace symlink, build, and .dev/scripts.
+# Grov CLI: worktrees, workspace symlink, build, and .grov/scripts.
 #
 # Install: run ./install from this repo (or ln -sf path/to/grov/grov ~/bin/grov).
 # Usage: grov <command> [args...]
-#   init                    convert current git repo to dev layout (bare at .dev/repo.git)
+#   init                    convert current git repo to dev layout (bare at .grov/repo.git)
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build
 #   build [branch]          composer install, do_release.py, touch last_commit in worktree
 #   status                  list worktrees and linked branch with git state
 #   remove <branch>         remove a worktree
 #   path                    print active workspace path
-#   <script>                run .dev/scripts/<script> if present
+#   <script>                run .grov/scripts/<script> if present
 
 set -e
 LINK_NAME="workspace"
 BRANCHES_DIR_NAME="branches"
-MAIN_WORKTREE="master"
-BARE_REPO=".dev/repo.git"
+BARE_REPO=".grov/repo.git"
+
+get_primary_dir() {
+  local root=$1
+  cat "$root/.grov/primary-dir" 2>/dev/null || echo "master"
+}
 
 find_dev_root() {
   local d="$PWD"
   while [[ -n "$d" && "$d" != "/" ]]; do
-    [[ -e "$d/.dev" ]] && echo "$d" && return 0
+    [[ -e "$d/.grov" ]] && echo "$d" && return 0
     d="${d%/*}"
   done
-  [[ -n "$GROV_ROOT" && -e "$GROV_ROOT/.dev" ]] && echo "$GROV_ROOT" && return 0
+  [[ -n "$GROV_ROOT" && -e "$GROV_ROOT/.grov" ]] && echo "$GROV_ROOT" && return 0
   local script_path
   script_path=$(readlink -f "$0" 2>/dev/null || true)
   if [[ -n "$script_path" ]]; then
     d=$(dirname "$script_path")
     d=$(dirname "$d")
-    [[ -e "$d/.dev" ]] && echo "$d" && return 0
+    [[ -e "$d/.grov" ]] && echo "$d" && return 0
   fi
   return 1
 }
@@ -92,7 +96,7 @@ usage() {
   echo "  status                  list worktrees and linked branch with git state"
   echo "  remove <branch>         remove a worktree"
   echo "  path                    print active workspace path"
-  echo "  <name>                  run .dev/scripts/<name> if present"
+  echo "  <name>                  run .grov/scripts/<name> if present"
   exit 1
 }
 
@@ -105,15 +109,17 @@ cmd_init() {
     exit 1
   }
   cd "$root" || exit 1
-  if [[ -e "$root/.dev" ]]; then
-    echo "Error: Already a grov project (.dev exists)." >&2
+  if [[ -e "$root/.grov" ]]; then
+    echo "Error: Already a grov project (.grov exists)." >&2
     exit 1
   fi
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="rescue"
   [[ "$branch" == "HEAD" || -z "$branch" ]] && branch="rescue"
   local branch_dir="${branch//[^a-zA-Z0-9._-]/_}"
-  mkdir -p .dev/scripts
+  mkdir -p .grov/scripts
+  echo "$branch_dir" > .grov/primary-dir
+  echo "$branch" > .grov/primary-branch
   git init --bare "$BARE_REPO"
   (cd "$root" && git remote add _dev_bare "$(pwd)/$BARE_REPO" && git push _dev_bare --all && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
   # Copy remotes from original repo into bare so fetch/push still work
@@ -132,16 +138,16 @@ cmd_init() {
   local link_path
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   ln -sfn "$BRANCHES_DIR_NAME/$branch_dir" "$link_path"
-  mkdir -p .dev/old-checkout
+  mkdir -p .grov/old-checkout
   (cd "$root" && git ls-files --others --exclude-standard) | while IFS= read -r f; do
     [[ -n "$f" && -e "$root/$f" ]] || continue
-    mkdir -p "$root/.dev/old-checkout/$(dirname "$f")"
-    mv "$root/$f" "$root/.dev/old-checkout/$f"
+    mkdir -p "$root/.grov/old-checkout/$(dirname "$f")"
+    mv "$root/$f" "$root/.grov/old-checkout/$f"
   done
-  find "$root" -mindepth 1 -maxdepth 1 ! -name .dev ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
+  find "$root" -mindepth 1 -maxdepth 1 ! -name .grov ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
   rm -rf "$root/.git"
-  echo "Untracked files from previous working tree. Refs in .dev/repo.git; worktree at branches/$branch_dir" > "$root/.dev/old-checkout/README.txt"
-  echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .dev/old-checkout."
+  echo "Untracked files from previous working tree. Refs in .grov/repo.git; worktree at branches/$branch_dir" > "$root/.grov/old-checkout/README.txt"
+  echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .grov/old-checkout."
 }
 
 cmd_path() {
@@ -180,9 +186,11 @@ cmd_checkout() {
       fi
     fi
   else
-    local repo="$root/$BRANCHES_DIR_NAME/$MAIN_WORKTREE"
+    local primary_dir
+    primary_dir=$(get_primary_dir "$root")
+    local repo="$root/$BRANCHES_DIR_NAME/$primary_dir"
     if [[ ! -d "$repo/.git" ]]; then
-      echo "Error: No .dev/repo.git and no main worktree at $repo. Run grov init first." >&2
+      echo "Error: No .grov/repo.git and no primary worktree at $repo. Run grov init first." >&2
       exit 1
     fi
     if [[ -d "$wt_path" ]]; then
@@ -255,11 +263,13 @@ cmd_remove() {
   if has_bare "$root"; then
     git --git-dir="$root/$BARE_REPO" worktree remove "$wt_path"
   else
-    if [[ "$branch" == "$MAIN_WORKTREE" ]]; then
-      echo "Error: Cannot remove the main worktree (master)." >&2
+    local primary_dir
+    primary_dir=$(get_primary_dir "$root")
+    if [[ "$branch" == "$primary_dir" ]]; then
+      echo "Error: Cannot remove the primary worktree ($primary_dir)." >&2
       exit 1
     fi
-    git -C "$root/$BRANCHES_DIR_NAME/$MAIN_WORKTREE" worktree remove "$wt_path"
+    git -C "$root/$BRANCHES_DIR_NAME/$primary_dir" worktree remove "$wt_path"
   fi
   echo "Removed worktree: $branch"
 }
@@ -318,8 +328,10 @@ cmd_restore() {
   [[ -z "$linked_dir" ]] && { echo "Error: Could not get linked branch." >&2; exit 1; }
   local linked_wt="$root/$BRANCHES_DIR_NAME/$linked_dir"
   [[ ! -d "$linked_wt" ]] && { echo "Error: Worktree $linked_wt not found." >&2; exit 1; }
+  local primary_branch
+  primary_branch=$(cat "$root/.grov/primary-branch" 2>/dev/null)
   local linked_branch
-  linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || linked_branch="$MAIN_WORKTREE"
+  linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || linked_branch="${primary_branch:-master}"
   local tmp="$root/.grov-restore-tmp"
   git clone --local "$root/$BARE_REPO" "$tmp" -b "$linked_branch" || {
     echo "Error: Clone from bare failed." >&2
@@ -339,7 +351,7 @@ cmd_restore() {
       done
     fi
   done < <(git -C "$root/$BARE_REPO" remote 2>/dev/null)
-  rm -rf "$root/.dev" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
+  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
   # Clear any other root content (e.g. .vscode from opening root in editor) so mv from tmp doesn't nest duplicates
   for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [[ -e "$f" && "$f" != "$tmp" ]] && rm -rf "$f"
@@ -359,7 +371,7 @@ if [[ "$cmd" == "init" ]]; then
 fi
 
 _raw_root=$(find_dev_root) || {
-  echo "Error: Cannot find grov root (no .dev in path and GROV_ROOT not set)." >&2
+  echo "Error: Cannot find grov root (no .grov in path and GROV_ROOT not set)." >&2
   exit 1
 }
 GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
@@ -375,7 +387,7 @@ case "$cmd" in
     usage
     ;;
   *)
-    script_path="$GROV_ROOT/.dev/scripts/$cmd"
+    script_path="$GROV_ROOT/.grov/scripts/$cmd"
     if [[ -x "$script_path" && -f "$script_path" ]]; then
       export GROV_ROOT
       exec "$script_path" "$@"

@@ -31,10 +31,10 @@ grovc() {
 _grov_find_root() {
   local d="$PWD"
   while [[ -n "$d" && "$d" != "/" ]]; do
-    [[ -e "$d/.dev" ]] && echo "$d" && return 0
+    [[ -e "$d/.grov" ]] && echo "$d" && return 0
     d="${d%/*}"
   done
-  [[ -n "$GROV_ROOT" && -e "$GROV_ROOT/.dev" ]] && echo "$GROV_ROOT" && return 0
+  [[ -n "$GROV_ROOT" && -e "$GROV_ROOT/.grov" ]] && echo "$GROV_ROOT" && return 0
   return 1
 }
 
@@ -52,8 +52,8 @@ _grov_list_branches() {
 _grov_list_git_branches() {
   local root
   root=$(_grov_find_root) || return
-  if [[ -d "$root/.dev/repo.git" ]]; then
-    git --git-dir="$root/.dev/repo.git" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | sort -u
+  if [[ -d "$root/.grov/repo.git" ]]; then
+    git --git-dir="$root/.grov/repo.git" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | sort -u
   else
     local repo="$root/branches/master"
     [[ ! -d "$repo/.git" ]] && return
@@ -64,7 +64,7 @@ _grov_list_git_branches() {
 _grov_list_scripts() {
   local root
   root=$(_grov_find_root) || return
-  local dir="$root/.dev/scripts"
+  local dir="$root/.grov/scripts"
   [[ ! -d "$dir" ]] && return
   local f
   for f in "$dir"/*; do
