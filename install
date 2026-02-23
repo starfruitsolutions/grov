@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Install dev CLI: link dev into a dir on PATH and optionally install bashrc snippet.
+# Install grov CLI: link grov into a dir on PATH and optionally install bashrc snippet.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${1:-$HOME/bin}"
 mkdir -p "$BIN_DIR"
-ln -sfn "$SCRIPT_DIR/dev" "$BIN_DIR/dev"
-echo "Installed: $BIN_DIR/dev"
+ln -sfn "$SCRIPT_DIR/grov" "$BIN_DIR/grov"
+echo "Installed: $BIN_DIR/grov"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo "Add to your .bashrc: export PATH=\"$BIN_DIR:\$PATH\""
 fi
-COMPLETION="$SCRIPT_DIR/dev-completion.bash"
+COMPLETION="$SCRIPT_DIR/grov-completion.bash"
 if [[ -f "$COMPLETION" ]]; then
   echo "Add to your .bashrc to enable wrapper and completion:"
   echo "  source $COMPLETION"

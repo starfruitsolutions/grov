@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Dev CLI: worktrees, workspace symlink, build, and .dev/scripts.
+# Grov CLI: worktrees, workspace symlink, build, and .dev/scripts.
 #
-# Install: run ./install from this repo (or ln -sf path/to/multi-tool/dev ~/bin/dev).
-# Usage: dev <command> [args...]
+# Install: run ./install from this repo (or ln -sf path/to/grov/grov ~/bin/grov).
+# Usage: grov <command> [args...]
 #   init                    convert current git repo to dev layout (bare at .dev/repo.git)
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build
 #   build [branch]          composer install, do_release.py, touch last_commit in worktree
@@ -23,7 +23,7 @@ find_dev_root() {
     [[ -e "$d/.dev" ]] && echo "$d" && return 0
     d="${d%/*}"
   done
-  [[ -n "$DEV_ROOT" && -e "$DEV_ROOT/.dev" ]] && echo "$DEV_ROOT" && return 0
+  [[ -n "$GROV_ROOT" && -e "$GROV_ROOT/.dev" ]] && echo "$GROV_ROOT" && return 0
   local script_path
   script_path=$(readlink -f "$0" 2>/dev/null || true)
   if [[ -n "$script_path" ]]; then
@@ -84,7 +84,7 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: dev <init|checkout|build|status|remove|path> [args...]"
+  echo "Usage: grov <init|checkout|build|status|remove|path> [args...]"
   echo "  init                    convert current git repo to dev layout"
   echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build"
   echo "  build [branch]          composer install, do_release.py, touch last_commit in worktree"
@@ -100,12 +100,12 @@ has_bare() { [[ -d "$1/$BARE_REPO" ]]; }
 cmd_init() {
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || {
-    echo "Error: Not inside a git repository. Run dev init from a repo root." >&2
+    echo "Error: Not inside a git repository. Run grov init from a repo root." >&2
     exit 1
   }
   cd "$root" || exit 1
   if [[ -e "$root/.dev" ]]; then
-    echo "Error: Already a dev project (.dev exists)." >&2
+    echo "Error: Already a grov project (.dev exists)." >&2
     exit 1
   fi
   local branch
@@ -144,7 +144,7 @@ cmd_checkout() {
   local create_branch=false
   if [[ "$1" == "-b" ]]; then create_branch=true; shift; fi
   local branch="$1"
-  [[ -z "$branch" ]] && echo "Usage: dev checkout [-b] <branch>" >&2 && exit 1
+  [[ -z "$branch" ]] && echo "Usage: grov checkout [-b] <branch>" >&2 && exit 1
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
   local bare="$root/$BARE_REPO"
@@ -158,7 +158,7 @@ cmd_checkout() {
         echo "Created branch '$branch' and worktree at $wt_path"
       else
         if ! git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
-          echo "Error: Branch '$branch' does not exist. Use: dev checkout -b <branch>" >&2
+          echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
           exit 1
         fi
         git --git-dir="$bare" worktree add "$wt_path" "$branch"
@@ -168,7 +168,7 @@ cmd_checkout() {
   else
     local repo="$root/$BRANCHES_DIR_NAME/$MAIN_WORKTREE"
     if [[ ! -d "$repo/.git" ]]; then
-      echo "Error: No .dev/repo.git and no main worktree at $repo. Run dev init first." >&2
+      echo "Error: No .dev/repo.git and no main worktree at $repo. Run grov init first." >&2
       exit 1
     fi
     if [[ -d "$wt_path" ]]; then
@@ -181,7 +181,7 @@ cmd_checkout() {
       echo "Created branch '$branch' from '$src' and worktree at $wt_path"
     else
       if ! git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
-        echo "Error: Branch '$branch' does not exist. Use: dev checkout -b <branch>" >&2
+        echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
         exit 1
       fi
       git -C "$repo" worktree add "$wt_path" "$branch"
@@ -204,7 +204,7 @@ cmd_build() {
     if [[ -z "$branch" ]]; then
       branch=$(get_linked_branch "$root")
       if [[ -z "$branch" ]]; then
-        echo "Error: Not inside a branch folder and workspace not linked. Use: dev build <branch>" >&2
+        echo "Error: Not inside a branch folder and workspace not linked. Use: grov build <branch>" >&2
         exit 1
       fi
     fi
@@ -231,7 +231,7 @@ cmd_remove() {
   local root=$1
   shift
   local branch="$1"
-  [[ -z "$branch" ]] && echo "Usage: dev remove <branch>" >&2 && exit 1
+  [[ -z "$branch" ]] && echo "Usage: grov remove <branch>" >&2 && exit 1
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
   if [[ ! -d "$wt_path" ]]; then
@@ -292,7 +292,7 @@ cmd_status() {
   done < <(list_branch_dirs "$root")
 }
 
-# Main: init does not require dev root
+# Main: init does not require grov root
 cmd="${1:-}"
 shift || true
 if [[ "$cmd" == "init" ]]; then
@@ -301,24 +301,24 @@ if [[ "$cmd" == "init" ]]; then
 fi
 
 _raw_root=$(find_dev_root) || {
-  echo "Error: Cannot find dev root (no .dev in path and DEV_ROOT not set)." >&2
+  echo "Error: Cannot find grov root (no .dev in path and GROV_ROOT not set)." >&2
   exit 1
 }
-DEV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
+GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
 
 case "$cmd" in
-  checkout)  cmd_checkout "$DEV_ROOT" "$@" ;;
-  build)     cmd_build "$DEV_ROOT" "$@" ;;
-  status)    cmd_status "$DEV_ROOT" "$@" ;;
-  remove)    cmd_remove "$DEV_ROOT" "$@" ;;
-  path)      cmd_path "$DEV_ROOT" ;;
+  checkout)  cmd_checkout "$GROV_ROOT" "$@" ;;
+  build)     cmd_build "$GROV_ROOT" "$@" ;;
+  status)    cmd_status "$GROV_ROOT" "$@" ;;
+  remove)    cmd_remove "$GROV_ROOT" "$@" ;;
+  path)      cmd_path "$GROV_ROOT" ;;
   "")
     usage
     ;;
   *)
-    script_path="$DEV_ROOT/.dev/scripts/$cmd"
+    script_path="$GROV_ROOT/.dev/scripts/$cmd"
     if [[ -x "$script_path" && -f "$script_path" ]]; then
-      export DEV_ROOT
+      export GROV_ROOT
       exec "$script_path" "$@"
     fi
     echo "Unknown command: $cmd" >&2
