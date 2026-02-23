@@ -117,9 +117,15 @@ cmd_init() {
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="rescue"
   [[ "$branch" == "HEAD" || -z "$branch" ]] && branch="rescue"
   local branch_dir="${branch//[^a-zA-Z0-9._-]/_}"
-  mkdir -p .grov/scripts
+  mkdir -p .grov/scripts .grov/old-checkout
   echo "$branch_dir" > .grov/primary-dir
   echo "$branch" > .grov/primary-branch
+  # Move untracked out first so we don't overwrite them when creating worktree at branches/
+  (cd "$root" && git ls-files --others --exclude-standard) | while IFS= read -r f; do
+    [[ -n "$f" && -e "$root/$f" ]] || continue
+    mkdir -p "$root/.grov/old-checkout/$(dirname "$f")"
+    mv "$root/$f" "$root/.grov/old-checkout/$f"
+  done
   git init --bare "$BARE_REPO"
   (cd "$root" && git remote add _dev_bare "$(pwd)/$BARE_REPO" && git push _dev_bare --all && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
   # Copy remotes from original repo into bare so fetch/push still work
@@ -133,17 +139,16 @@ cmd_init() {
     done
   done < <(git -C "$root" remote 2>/dev/null)
   mkdir -p "$BRANCHES_DIR_NAME"
-  git --git-dir="$root/$BARE_REPO" worktree add "$BRANCHES_DIR_NAME/$branch_dir" "$branch" 2>/dev/null || \
-    git --git-dir="$root/$BARE_REPO" worktree add "$BRANCHES_DIR_NAME/$branch_dir" HEAD
+  local wt_path
+  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch_dir
+  if ! git --git-dir="$root/$BARE_REPO" rev-parse --verify "$branch" &>/dev/null; then
+    echo "Error: Branch '$branch' not in bare repo (push may have failed)." >&2
+    exit 1
+  fi
+  git --git-dir="$root/$BARE_REPO" worktree add "$wt_path" "$branch"
   local link_path
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   ln -sfn "$BRANCHES_DIR_NAME/$branch_dir" "$link_path"
-  mkdir -p .grov/old-checkout
-  (cd "$root" && git ls-files --others --exclude-standard) | while IFS= read -r f; do
-    [[ -n "$f" && -e "$root/$f" ]] || continue
-    mkdir -p "$root/.grov/old-checkout/$(dirname "$f")"
-    mv "$root/$f" "$root/.grov/old-checkout/$f"
-  done
   find "$root" -mindepth 1 -maxdepth 1 ! -name .grov ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
   rm -rf "$root/.git"
   echo "Untracked files from previous working tree. Refs in .grov/repo.git; worktree at branches/$branch_dir" > "$root/.grov/old-checkout/README.txt"
