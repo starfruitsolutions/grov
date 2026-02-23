@@ -326,6 +326,10 @@ cmd_restore() {
     exit 1
   }
   rm -rf "$root/.dev" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME"
+  # Clear any other root content (e.g. .vscode from opening root in editor) so mv from tmp doesn't nest duplicates
+  for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    [[ -e "$f" && "$f" != "$tmp" ]] && rm -rf "$f"
+  done
   mv "$tmp/.git" "$root/.git"
   (cd "$tmp" && shopt -s dotglob nullglob 2>/dev/null; for f in *; do [[ -n "$f" && "$f" != ".git" && -e "$f" ]] && mv "$f" "$root/$f"; done)
   rm -rf "$tmp"

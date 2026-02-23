@@ -4,14 +4,21 @@
 # Wrapper grov(): runs command grov; on success, if we're inside a grov project, cd to root then workspace.
 
 grov() {
-  local ret
+  local ret restore_root
+  if [[ "$1" == "restore" ]]; then
+    restore_root=$(_grov_find_root 2>/dev/null)
+  fi
   command grov "$@"
   ret=$?
   if [[ $ret -eq 0 ]]; then
-    local root
-    root=$(_grov_find_root 2>/dev/null)
-    if [[ -n "$root" && -e "$root/workspace" ]]; then
-      cd "$root" && cd workspace
+    if [[ -n "$restore_root" && "$1" == "restore" ]]; then
+      cd "$restore_root"
+    else
+      local root
+      root=$(_grov_find_root 2>/dev/null)
+      if [[ -n "$root" && -e "$root/workspace" ]]; then
+        cd "$root" && cd workspace
+      fi
     fi
   fi
   return $ret
