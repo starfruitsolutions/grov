@@ -30,7 +30,7 @@ BASHRC="${BASHRC:-$HOME/.bashrc}"
 COMPLETION="$BIN_DIR/grov-completion.bash"
 if [[ -f "$COMPLETION" && -f "$BASHRC" ]]; then
   if grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null; then
-    :
+    echo "Completions already in $BASHRC (reload with: source $BASHRC)"
   else
     echo -n "Add completions to ~/.bashrc? [y/N] "
     read -r ans

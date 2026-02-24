@@ -90,10 +90,13 @@ _grov() {
   case "$cmd" in
     init) ;;
     checkout)
+      compopt +o default 2>/dev/null
       if [[ $cword -eq 2 ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       elif [[ $cword -eq 3 && "$prev" == "-b" ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      else
+        COMPREPLY=()
       fi
       ;;
     build)
