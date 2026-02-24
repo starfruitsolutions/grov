@@ -53,11 +53,13 @@ _grov_list_git_branches() {
   local root
   root=$(_grov_find_root) || return
   if [[ -d "$root/.grov/repo.git" ]]; then
-    git --git-dir="$root/.grov/repo.git" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | sort -u
+    git --git-dir="$root/.grov/repo.git" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | grep -v '^$' | sort -u
   else
-    local repo="$root/branches/master"
+    local primary_dir
+    primary_dir=$(cat "$root/.grov/primary-dir" 2>/dev/null) || primary_dir="master"
+    local repo="$root/branches/$primary_dir"
     [[ ! -d "$repo/.git" ]] && return
-    git -C "$repo" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | sort -u
+    git -C "$repo" branch -a 2>/dev/null | sed -e 's/^[* ]*//' -e 's|^remotes/origin/||' -e 's|^remotes/||' | grep -v 'HEAD ' | grep -v '^$' | sort -u
   fi
 }
 
@@ -89,7 +91,7 @@ _grov() {
     init) ;;
     checkout)
       if [[ $cword -eq 2 ]]; then
-        COMPREPLY=($(compgen -W "$(_grov_list_git_branches) -b" -- "$cur"))
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       elif [[ $cword -eq 3 && "$prev" == "-b" ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       fi
