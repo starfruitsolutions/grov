@@ -28,23 +28,13 @@ fi
 
 BASHRC="${BASHRC:-$HOME/.bashrc}"
 COMPLETION="$BIN_DIR/grov-completion.bash"
-if [[ -f "$COMPLETION" && -f "$BASHRC" ]]; then
-  if grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null; then
-    echo "Completions already in $BASHRC (reload with: source $BASHRC)"
-  else
-    echo -n "Add completions to ~/.bashrc? [y/N] "
-    read -r ans
-    if [[ "$ans" == [yY]* ]]; then
+if [[ -f "$COMPLETION" ]]; then
+  if [[ -f "$BASHRC" ]]; then
+    grep -qF "grov-completion.bash" "$BASHRC" 2>/dev/null || {
       echo "" >> "$BASHRC"
       echo "# grov completion" >> "$BASHRC"
       echo "source $COMPLETION" >> "$BASHRC"
-      echo "Added completion to $BASHRC"
-      echo -n "Run 'source ~/.bashrc' to enable now? [y/N] "
-      read -r ans2
-      if [[ "$ans2" == [yY]* ]]; then
-        source "$BASHRC"
-        echo "Done."
-      fi
-    fi
+    }
   fi
+  source "$COMPLETION"
 fi
