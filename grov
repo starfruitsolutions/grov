@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Grov CLI: worktrees, workspace symlink, build, and .grov/scripts.
+# Grov CLI: worktrees, workspace symlink, and .grov/scripts.
 #
 # Install: run ./install from this repo (or ln -sf path/to/grov/grov ~/bin/grov).
 # Usage: grov <command> [args...]
 #   init                    convert current git repo to dev layout (bare at .grov/repo.git)
-#   checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build
-#   build [branch]          composer install, do_release.py, touch last_commit in worktree
+#   checkout [-b] <branch>  ensure worktree exists, point workspace at it
 #   status                  list worktrees and linked branch with git state
 #   remove <branch>         remove a worktree
 #   path                    print active workspace path
+#   scripts                 list custom scripts in .grov/scripts
 #   <script>                run .grov/scripts/<script> if present
 
 set -e
@@ -88,14 +88,14 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: grov <init|checkout|build|status|remove|path|restore> [args...]"
+  echo "Usage: grov <init|checkout|status|remove|path|restore|scripts> [args...]"
   echo "  init                    convert current git repo to grov layout"
   echo "  restore                 convert grov project back to normal git repo (linked branch at root)"
-  echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it; runs build"
-  echo "  build [branch]          composer install, do_release.py, touch last_commit in worktree"
+  echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it"
   echo "  status                  list worktrees and linked branch with git state"
   echo "  remove <branch>         remove a worktree"
   echo "  path                    print active workspace path"
+  echo "  scripts                 list custom scripts in .grov/scripts"
   echo "  <name>                  run .grov/scripts/<name> if present"
   exit 1
 }
@@ -219,39 +219,16 @@ cmd_checkout() {
   local link_path
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   ln -sfn "$BRANCHES_DIR_NAME/$branch" "$link_path"
-  echo "Running build in $wt_path..."
-  cmd_build "$root" "$branch"
 }
 
-cmd_build() {
+cmd_scripts() {
   local root=$1
-  local branch="${2:-}"
-  if [[ -z "$branch" ]]; then
-    branch=$(get_current_branch_from_cwd "$root")
-    if [[ -z "$branch" ]]; then
-      branch=$(get_linked_branch "$root")
-      if [[ -z "$branch" ]]; then
-        echo "Error: Not inside a branch folder and workspace not linked. Use: grov build <branch>" >&2
-        exit 1
-      fi
-    fi
-  fi
-
-  local wt_path
-  wt_path=$(get_worktree_path "$root" "$branch")
-  wt_path=$(readlink -f "$wt_path" 2>/dev/null || true)
-  [[ -z "$wt_path" || ! -d "$wt_path" ]] && wt_path="$root/$BRANCHES_DIR_NAME/$branch"
-
-  if [[ ! -d "$wt_path" ]]; then
-    echo "Error: Worktree does not exist: $wt_path" >&2
-    exit 1
-  fi
-  if [[ -f "$wt_path/composer.json" && -f "$wt_path/do_release.py" ]]; then
-    echo "Building branch: $branch ( $wt_path )"
-    ( cd "$wt_path" && composer install && python3 do_release.py && touch last_commit && echo "Build complete." )
-  else
-    echo "Skipping build (no composer.json or do_release.py in $wt_path)."
-  fi
+  local dir="$root/.grov/scripts"
+  [[ ! -d "$dir" ]] && return 0
+  local f
+  for f in "$dir"/*; do
+    [[ -f "$f" && -x "$f" ]] && basename "$f"
+  done | sort
 }
 
 cmd_remove() {
@@ -394,11 +371,11 @@ GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
 
 case "$cmd" in
   checkout)  cmd_checkout "$GROV_ROOT" "$@" ;;
-  build)     cmd_build "$GROV_ROOT" "$@" ;;
   status)    cmd_status "$GROV_ROOT" "$@" ;;
   remove)    cmd_remove "$GROV_ROOT" "$@" ;;
   path)      cmd_path "$GROV_ROOT" ;;
   restore)   cmd_restore "$GROV_ROOT" ;;
+  scripts)   cmd_scripts "$GROV_ROOT" ;;
   "")
     usage
     ;;
