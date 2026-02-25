@@ -22,11 +22,22 @@ if [[ -f "$SCRIPT_DIR/grov-completion.bash" ]]; then
 fi
 echo "Installed: $BIN_DIR/grov"
 
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo "Note: ensure $BIN_DIR is on your PATH (e.g. add to ~/.bashrc: export PATH=\"\$HOME/.local/bin:\$PATH\")."
+BASHRC="${BASHRC:-$HOME/.bashrc}"
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && [[ -f "$BASHRC" ]]; then
+  if ! grep -qF "$BIN_DIR" "$BASHRC" 2>/dev/null; then
+    echo -n "Add $BIN_DIR to PATH in $BASHRC? [y/N] "
+    read -r ans
+    if [[ "$ans" == [yY]* ]]; then
+      echo "" >> "$BASHRC"
+      echo "# grov (add bin to PATH)" >> "$BASHRC"
+      echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$BASHRC"
+      echo "Added to $BASHRC. Run: source $BASHRC"
+    else
+      echo "Note: ensure $BIN_DIR is on your PATH (e.g. add to $BASHRC: export PATH=\"$BIN_DIR:\$PATH\")."
+    fi
+  fi
 fi
 
-BASHRC="${BASHRC:-$HOME/.bashrc}"
 COMPLETION="$BIN_DIR/grov-completion.bash"
 if [[ -f "$COMPLETION" ]]; then
   if [[ -f "$BASHRC" ]]; then
