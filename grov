@@ -422,6 +422,17 @@ case "$cmd" in
       export GROV_ROOT
       exec "$script_path" "$@"
     fi
+    if [[ -f "$script_path" ]]; then
+      echo "Script exists but is not executable: $script_path" >&2
+      echo -n "Make it executable? [y/N] " >&2
+      read -r ans
+      if [[ "$ans" == [yY]* ]]; then
+        chmod +x "$script_path"
+        export GROV_ROOT
+        exec "$script_path" "$@"
+      fi
+      exit 1
+    fi
     echo "Unknown command: $cmd" >&2
     usage
     ;;
