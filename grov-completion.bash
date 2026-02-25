@@ -77,7 +77,7 @@ _grov_list_scripts() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout status remove path scripts"
+  local commands="init restore checkout status remove root branch branches path scripts"
   local scripts
   scripts=$(_grov_list_scripts 2>/dev/null)
   local all_commands
@@ -104,7 +104,12 @@ _grov() {
     remove)
       [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
       ;;
-    path) ;;
+    root) ;;
+    branch) ;;
+    branches) ;;
+    path)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+      ;;
     restore) ;;
     *)
       COMPREPLY=()

@@ -7,7 +7,10 @@
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it
 #   status                  list worktrees and linked branch with git state
 #   remove <branch>         remove a worktree
-#   path                    print active workspace path
+#   root                    print grov project root
+#   branch                  print active (linked) branch name
+#   branches                list worktree branch names
+#   path [branch]           print active workspace path, or path to branch worktree
 #   scripts                 list custom scripts in .grov/scripts
 #   <script>                run .grov/scripts/<script> if present
 
@@ -88,13 +91,16 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: grov <init|checkout|status|remove|path|restore|scripts> [args...]"
+  echo "Usage: grov <init|checkout|status|remove|root|branch|branches|path|restore|scripts> [args...]"
   echo "  init                    convert current git repo to grov layout"
   echo "  restore                 convert grov project back to normal git repo (linked branch at root)"
   echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it"
   echo "  status                  list worktrees and linked branch with git state"
   echo "  remove <branch>         remove a worktree"
-  echo "  path                    print active workspace path"
+  echo "  root                    print grov project root"
+  echo "  branch                  print active (linked) branch name"
+  echo "  branches                list worktree branch names"
+  echo "  path [branch]           print active workspace path, or path to branch worktree"
   echo "  scripts                 list custom scripts in .grov/scripts"
   echo "  <name>                  run .grov/scripts/<name> if present"
   exit 1
@@ -155,12 +161,40 @@ cmd_init() {
   echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .grov/old-checkout."
 }
 
-cmd_path() {
+cmd_root() {
+  echo "$1"
+}
+
+cmd_branch() {
   local root=$1
   ensure_workspace "$root" || { echo "Error: No workspace (no branches?)." >&2; exit 1; }
-  local link_path
-  link_path=$(cd "$root" && pwd)/$LINK_NAME
-  readlink -f "$link_path"
+  get_linked_branch "$root"
+}
+
+cmd_branches() {
+  list_branch_dirs "$1"
+}
+
+cmd_path() {
+  local root=$1
+  shift
+  local branch="${1:-}"
+  if [[ -n "$branch" ]]; then
+    local wt_path
+    wt_path=$(get_worktree_path "$root" "$branch")
+    wt_path=$(readlink -f "$wt_path" 2>/dev/null || true)
+    [[ -z "$wt_path" || ! -d "$wt_path" ]] && wt_path="$root/$BRANCHES_DIR_NAME/$branch"
+    if [[ ! -d "$wt_path" ]]; then
+      echo "Error: Worktree does not exist: $wt_path" >&2
+      exit 1
+    fi
+    echo "$wt_path"
+  else
+    ensure_workspace "$root" || { echo "Error: No workspace (no branches?)." >&2; exit 1; }
+    local link_path
+    link_path=$(cd "$root" && pwd)/$LINK_NAME
+    readlink -f "$link_path"
+  fi
 }
 
 cmd_checkout() {
@@ -370,12 +404,15 @@ _raw_root=$(find_dev_root) || {
 GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
 
 case "$cmd" in
-  checkout)  cmd_checkout "$GROV_ROOT" "$@" ;;
-  status)    cmd_status "$GROV_ROOT" "$@" ;;
-  remove)    cmd_remove "$GROV_ROOT" "$@" ;;
-  path)      cmd_path "$GROV_ROOT" ;;
-  restore)   cmd_restore "$GROV_ROOT" ;;
-  scripts)   cmd_scripts "$GROV_ROOT" ;;
+  checkout)   cmd_checkout "$GROV_ROOT" "$@" ;;
+  status)     cmd_status "$GROV_ROOT" "$@" ;;
+  remove)     cmd_remove "$GROV_ROOT" "$@" ;;
+  root)       cmd_root "$GROV_ROOT" ;;
+  branch)     cmd_branch "$GROV_ROOT" ;;
+  branches)   cmd_branches "$GROV_ROOT" ;;
+  path)       cmd_path "$GROV_ROOT" "$@" ;;
+  restore)    cmd_restore "$GROV_ROOT" ;;
+  scripts)    cmd_scripts "$GROV_ROOT" ;;
   "")
     usage
     ;;
