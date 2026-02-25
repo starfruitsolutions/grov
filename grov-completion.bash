@@ -1,24 +1,21 @@
 # Bash init for grov CLI: wrapper + completion
 # Add to .bashrc: source /path/to/grov-completion.bash
 #
-# Wrapper grov(): runs command grov; on success, if we're inside a grov project, cd to root then workspace.
+# Wrapper grov(): only cd to workspace after checkout when already inside the project; restore still cds to (former) root.
 
 grov() {
-  local ret restore_root
+  local ret restore_root project_root
+  project_root=$(_grov_find_root 2>/dev/null)
   if [[ "$1" == "restore" ]]; then
-    restore_root=$(_grov_find_root 2>/dev/null)
+    restore_root=$project_root
   fi
   command grov "$@"
   ret=$?
   if [[ $ret -eq 0 ]]; then
     if [[ -n "$restore_root" && "$1" == "restore" ]]; then
       cd "$restore_root"
-    else
-      local root
-      root=$(_grov_find_root 2>/dev/null)
-      if [[ -n "$root" && -e "$root/workspace" ]]; then
-        cd "$root" && cd workspace
-      fi
+    elif [[ "$1" == "checkout" && -n "$project_root" && -e "$project_root/workspace" ]]; then
+      cd "$project_root" && cd workspace
     fi
   fi
   return $ret
