@@ -5,6 +5,8 @@
 # Usage: grov <command> [args...]
 #   init                    convert current git repo to dev layout (bare at .grov/repo.git)
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it
+#   switch <branch>         point workspace at existing worktree only
+#   add [-b] <branch>      create worktree only (no link change)
 #   status                  list worktrees and linked branch with git state
 #   remove <branch>         remove a worktree
 #   root                    print grov project root
@@ -91,10 +93,12 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: grov <init|checkout|status|remove|root|branch|branches|path|restore|scripts> [args...]"
+  echo "Usage: grov <init|checkout|switch|add|status|remove|root|branch|branches|path|restore|scripts> [args...]"
   echo "  init                    convert current git repo to grov layout"
   echo "  restore                 convert grov project back to normal git repo (linked branch at root)"
   echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it"
+  echo "  switch <branch>         point workspace at existing worktree only"
+  echo "  add [-b] <branch>      create worktree only (no link change)"
   echo "  status                  list worktrees and linked branch with git state"
   echo "  remove <branch>         remove a worktree"
   echo "  root                    print grov project root"
@@ -107,6 +111,57 @@ usage() {
 }
 
 has_bare() { [[ -d "$1/$BARE_REPO" ]]; }
+
+ensure_worktree() {
+  local root=$1
+  local create_branch=$2
+  local branch=$3
+  local wt_path
+  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
+  local bare="$root/$BARE_REPO"
+  if has_bare "$root"; then
+    if [[ ! -d "$wt_path" ]]; then
+      if [[ "$create_branch" == true ]]; then
+        local src
+        src=$(get_linked_branch "$root")
+        [[ -z "$src" ]] && src="HEAD"
+        git --git-dir="$bare" worktree add -b "$branch" "$wt_path" "$src"
+        echo "Created branch '$branch' and worktree at $wt_path"
+      else
+        if ! git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
+          echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
+          exit 1
+        fi
+        git --git-dir="$bare" worktree add "$wt_path" "$branch"
+        echo "Created worktree at $wt_path"
+      fi
+    fi
+  else
+    local primary_dir
+    primary_dir=$(get_primary_dir "$root")
+    local repo="$root/$BRANCHES_DIR_NAME/$primary_dir"
+    if [[ ! -d "$repo/.git" ]]; then
+      echo "Error: No .grov/repo.git and no primary worktree at $repo. Run grov init first." >&2
+      exit 1
+    fi
+    if [[ -d "$wt_path" ]]; then
+      :
+    elif [[ "$create_branch" == true ]]; then
+      local src
+      src=$(get_linked_branch "$root")
+      [[ -z "$src" ]] && echo "Error: workspace not linked; cannot use -b." >&2 && exit 1
+      git -C "$repo" worktree add -b "$branch" "$wt_path" "$src"
+      echo "Created branch '$branch' from '$src' and worktree at $wt_path"
+    else
+      if ! git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
+        echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
+        exit 1
+      fi
+      git -C "$repo" worktree add "$wt_path" "$branch"
+      echo "Created worktree at $wt_path"
+    fi
+  fi
+}
 
 cmd_init() {
   local root
@@ -200,59 +255,38 @@ cmd_path() {
 cmd_checkout() {
   local root=$1
   shift
-  local create_branch=false
-  if [[ "$1" == "-b" ]]; then create_branch=true; shift; fi
   local branch="$1"
+  [[ "$1" == "-b" ]] && branch="$2"
   [[ -z "$branch" ]] && echo "Usage: grov checkout [-b] <branch>" >&2 && exit 1
+  cmd_add "$root" "$@"
+  cmd_switch "$root" "$branch"
+}
+
+cmd_switch() {
+  local root=$1
+  shift
+  local branch="$1"
+  [[ -z "$branch" ]] && echo "Usage: grov switch <branch>" >&2 && exit 1
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
-  local bare="$root/$BARE_REPO"
-  if has_bare "$root"; then
-    if [[ ! -d "$wt_path" ]]; then
-      if [[ "$create_branch" == true ]]; then
-        local src
-        src=$(get_linked_branch "$root")
-        [[ -z "$src" ]] && src="HEAD"
-        git --git-dir="$bare" worktree add -b "$branch" "$wt_path" "$src"
-        echo "Created branch '$branch' and worktree at $wt_path"
-      else
-        if ! git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
-          echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
-          exit 1
-        fi
-        git --git-dir="$bare" worktree add "$wt_path" "$branch"
-        echo "Created worktree at $wt_path"
-      fi
-    fi
-  else
-    local primary_dir
-    primary_dir=$(get_primary_dir "$root")
-    local repo="$root/$BRANCHES_DIR_NAME/$primary_dir"
-    if [[ ! -d "$repo/.git" ]]; then
-      echo "Error: No .grov/repo.git and no primary worktree at $repo. Run grov init first." >&2
-      exit 1
-    fi
-    if [[ -d "$wt_path" ]]; then
-      :
-    elif [[ "$create_branch" == true ]]; then
-      local src
-      src=$(get_linked_branch "$root")
-      [[ -z "$src" ]] && echo "Error: workspace not linked; cannot use -b." >&2 && exit 1
-      git -C "$repo" worktree add -b "$branch" "$wt_path" "$src"
-      echo "Created branch '$branch' from '$src' and worktree at $wt_path"
-    else
-      if ! git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
-        echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
-        exit 1
-      fi
-      git -C "$repo" worktree add "$wt_path" "$branch"
-      echo "Created worktree at $wt_path"
-    fi
+  if [[ ! -d "$wt_path" ]]; then
+    echo "Error: Worktree does not exist. Use: grov checkout <branch> or grov add <branch>" >&2
+    exit 1
   fi
   ensure_workspace "$root" || true
   local link_path
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   ln -sfn "$BRANCHES_DIR_NAME/$branch" "$link_path"
+}
+
+cmd_add() {
+  local root=$1
+  shift
+  local create_branch=false
+  if [[ "$1" == "-b" ]]; then create_branch=true; shift; fi
+  local branch="$1"
+  [[ -z "$branch" ]] && echo "Usage: grov add [-b] <branch>" >&2 && exit 1
+  ensure_worktree "$root" "$create_branch" "$branch"
 }
 
 cmd_scripts() {
@@ -405,6 +439,8 @@ GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
 
 case "$cmd" in
   checkout)   cmd_checkout "$GROV_ROOT" "$@" ;;
+  switch)     cmd_switch "$GROV_ROOT" "$@" ;;
+  add)        cmd_add "$GROV_ROOT" "$@" ;;
   status)     cmd_status "$GROV_ROOT" "$@" ;;
   remove)     cmd_remove "$GROV_ROOT" "$@" ;;
   root)       cmd_root "$GROV_ROOT" ;;

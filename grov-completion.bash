@@ -1,20 +1,27 @@
 # Bash init for grov CLI: wrapper + completion
 # Add to .bashrc: source /path/to/grov-completion.bash
 #
-# Wrapper grov(): only cd to workspace after checkout when already inside the project; restore still cds to (former) root.
+# Wrapper grov(): checkout and switch only cd to workspace when cwd is already in workspace; restore cds to (former) root.
 
 grov() {
-  local ret restore_root project_root
+  local ret restore_root project_root in_workspace
   project_root=$(_grov_find_root 2>/dev/null)
   if [[ "$1" == "restore" ]]; then
     restore_root=$project_root
+  fi
+  if [[ ( "$1" == "checkout" || "$1" == "switch" ) && -n "$project_root" && -L "$project_root/workspace" ]]; then
+    local ws_path
+    ws_path=$(readlink -f "$project_root/workspace" 2>/dev/null)
+    if [[ -n "$ws_path" && "$(readlink -f "$PWD" 2>/dev/null)" == "$ws_path"* ]]; then
+      in_workspace=1
+    fi
   fi
   command grov "$@"
   ret=$?
   if [[ $ret -eq 0 ]]; then
     if [[ -n "$restore_root" && "$1" == "restore" ]]; then
       cd "$restore_root"
-    elif [[ "$1" == "checkout" && -n "$project_root" && -e "$project_root/workspace" ]]; then
+    elif [[ ( "$1" == "checkout" || "$1" == "switch" ) && -n "$in_workspace" && -n "$project_root" && -e "$project_root/workspace" ]]; then
       cd "$project_root" && cd workspace
     fi
   fi
@@ -74,7 +81,7 @@ _grov_list_scripts() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout status remove root branch branches path scripts"
+  local commands="init restore checkout switch add status remove root branch branches path scripts"
   local scripts
   scripts=$(_grov_list_scripts 2>/dev/null)
   local all_commands
@@ -90,6 +97,19 @@ _grov() {
       compopt +o default 2>/dev/null
       if [[ $cword -eq 2 ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      elif [[ $cword -eq 3 && "$prev" == "-b" ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      else
+        COMPREPLY=()
+      fi
+      ;;
+    switch)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+      ;;
+    add)
+      compopt +o default 2>/dev/null
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "-b $(_grov_list_git_branches)" -- "$cur"))
       elif [[ $cword -eq 3 && "$prev" == "-b" ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       else
