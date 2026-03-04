@@ -112,6 +112,35 @@ usage() {
 
 has_bare() { [[ -d "$1/$BARE_REPO" ]]; }
 
+# Resolve branch to a ref (local branch name or origin/branch). Echoes ref and returns 0 if found, else return 1.
+resolve_branch_ref() {
+  local root=$1
+  local branch=$2
+  local bare="$root/$BARE_REPO"
+  if has_bare "$root"; then
+    if git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
+      echo "$branch"; return 0
+    fi
+    git --git-dir="$bare" fetch origin &>/dev/null || true
+    if git --git-dir="$bare" rev-parse --verify "origin/$branch" &>/dev/null; then
+      echo "origin/$branch"; return 0
+    fi
+  else
+    local primary_dir
+    primary_dir=$(get_primary_dir "$root")
+    local repo="$root/$BRANCHES_DIR_NAME/$primary_dir"
+    [[ ! -d "$repo/.git" ]] && return 1
+    if git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
+      echo "$branch"; return 0
+    fi
+    git -C "$repo" fetch origin &>/dev/null || true
+    if git -C "$repo" rev-parse --verify "origin/$branch" &>/dev/null; then
+      echo "origin/$branch"; return 0
+    fi
+  fi
+  return 1
+}
+
 ensure_worktree() {
   local root=$1
   local create_branch=$2
@@ -128,12 +157,19 @@ ensure_worktree() {
         git --git-dir="$bare" worktree add -b "$branch" "$wt_path" "$src"
         echo "Created branch '$branch' and worktree at $wt_path"
       else
-        if ! git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
+        local ref
+        ref=$(resolve_branch_ref "$root" "$branch") || {
           echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
           exit 1
+        }
+        if [[ "$ref" == "origin/$branch" ]]; then
+          git --git-dir="$bare" worktree add -b "$branch" "$wt_path" "origin/$branch"
+          git -C "$wt_path" branch --set-upstream-to="origin/$branch" &>/dev/null || true
+          echo "Created worktree at $wt_path (from origin/$branch)"
+        else
+          git --git-dir="$bare" worktree add "$wt_path" "$branch"
+          echo "Created worktree at $wt_path"
         fi
-        git --git-dir="$bare" worktree add "$wt_path" "$branch"
-        echo "Created worktree at $wt_path"
       fi
     fi
   else
@@ -153,12 +189,19 @@ ensure_worktree() {
       git -C "$repo" worktree add -b "$branch" "$wt_path" "$src"
       echo "Created branch '$branch' from '$src' and worktree at $wt_path"
     else
-      if ! git -C "$repo" rev-parse --verify "$branch" &>/dev/null; then
+      local ref
+      ref=$(resolve_branch_ref "$root" "$branch") || {
         echo "Error: Branch '$branch' does not exist. Use: grov checkout -b <branch>" >&2
         exit 1
+      }
+      if [[ "$ref" == "origin/$branch" ]]; then
+        git -C "$repo" worktree add -b "$branch" "$wt_path" "origin/$branch"
+        git -C "$wt_path" branch --set-upstream-to="origin/$branch" &>/dev/null || true
+        echo "Created worktree at $wt_path (from origin/$branch)"
+      else
+        git -C "$repo" worktree add "$wt_path" "$branch"
+        echo "Created worktree at $wt_path"
       fi
-      git -C "$repo" worktree add "$wt_path" "$branch"
-      echo "Created worktree at $wt_path"
     fi
   fi
 }
