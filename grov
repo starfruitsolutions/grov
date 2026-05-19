@@ -7,7 +7,7 @@
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it
 #   switch <branch>         point workspace at existing worktree only
 #   add [-b] <branch>       create worktree only (no link change)
-#   status                  list worktrees, stack tree, linked branch, git state
+#   status [--no-fetch]     list worktrees, stack tree, linked branch, git state (fetches by default)
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
 #   restack [--continue|--abort]   rebase stacked branches onto parents (ordered)
 #   push [--yes] [--dry-run] [--from <b>]   push linked branch subtree with --force-with-lease
@@ -315,7 +315,7 @@ usage() {
   echo "  checkout [-b] <branch>   ensure worktree exists, point workspace at it"
   echo "  switch <branch>          point workspace at existing worktree only"
   echo "  add [-b] <branch>        create worktree only (no link change)"
-  echo "  status                   list worktrees, stack tree, git state"
+  echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
   echo "  remove <branch>          remove worktree (stack branch must be a leaf)"
   echo "  restack [--continue|--abort]   rebase stacked branches (parent order)"
   echo "  push [--yes] [--dry-run] [--from <branch>]   push subtree with --force-with-lease"
@@ -673,9 +673,27 @@ git_state_line() {
 
 cmd_status() {
   local root=$1
+  shift
+  local do_fetch=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-fetch) do_fetch=false ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
   ensure_workspace "$root" || true
   stack_ensure_file "$root"
   require_python3
+  if [[ "$do_fetch" == true && -z "$GROV_NO_FETCH" ]]; then
+    if has_bare "$root"; then
+      git --git-dir="$root/$BARE_REPO" fetch --all --quiet 2>/dev/null || true
+    else
+      local primary_dir
+      primary_dir=$(get_primary_dir "$root")
+      git -C "$root/$BRANCHES_DIR_NAME/$primary_dir" fetch --all --quiet 2>/dev/null || true
+    fi
+  fi
   local link_path="$root/$LINK_NAME"
   local linked=""
   if [[ -L "$link_path" ]]; then
