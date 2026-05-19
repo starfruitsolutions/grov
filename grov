@@ -1,25 +1,230 @@
 #!/usr/bin/env bash
-# Grov CLI: worktrees, workspace symlink, and .grov/scripts.
+# Grov CLI: worktrees, workspace symlink, stacked branch metadata, .grov/scripts.
 #
 # Install: run ./install from this repo (or ln -sf path/to/grov/grov ~/bin/grov).
 # Usage: grov <command> [args...]
 #   init                    convert current git repo to dev layout (bare at .grov/repo.git)
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it
 #   switch <branch>         point workspace at existing worktree only
-#   add [-b] <branch>      create worktree only (no link change)
-#   status                  list worktrees and linked branch with git state
-#   remove <branch>         remove a worktree
+#   add [-b] <branch>       create worktree only (no link change)
+#   status                  list worktrees, stack tree, linked branch, git state
+#   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
+#   restack [--continue|--abort]   rebase stacked branches onto parents (ordered)
+#   push [--yes] [--dry-run] [--from <b>]   push linked branch subtree with --force-with-lease
+#   parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (defaults parent to base)
+#   base [<branch>]         show or set the global base (trunk) branch
+#   stack remove <branch>   remove leaf from stack metadata + worktree
+#   stack doctor            validate stack.json vs worktrees
 #   root                    print grov project root
 #   branch                  print active (linked) branch name
 #   branches                list worktree branch names
 #   path [branch]           print active workspace path, or path to branch worktree
 #   scripts                 list custom scripts in .grov/scripts
-#   <script>                run .grov/scripts/<script> if present
+#   run <name> [args...]    run .grov/scripts/<name>
 
 set -e
 LINK_NAME="workspace"
 BRANCHES_DIR_NAME="branches"
 BARE_REPO=".grov/repo.git"
+STACK_JSON=".grov/stack.json"
+
+require_python3() {
+  command -v python3 &>/dev/null || {
+    echo "Error: python3 is required for grov stack features (.grov/stack.json)." >&2
+    exit 1
+  }
+}
+
+stack_path() {
+  echo "$1/$STACK_JSON"
+}
+
+stack_ensure_file() {
+  local root=$1
+  local p
+  p=$(stack_path "$root")
+  [[ -f "$p" ]] && return 0
+  mkdir -p "$root/.grov"
+  printf '%s\n' '{"version":1,"nodes":{}}' >"$p"
+}
+
+stack_get_base() {
+  local root=$1
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" <<'PY'
+import json, sys
+root = sys.argv[1]
+with open(f"{root}/.grov/stack.json") as f:
+    d = json.load(f)
+print(d.get("base") or "")
+PY
+}
+
+stack_set_base() {
+  local root=$1
+  local base=$2
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$base" <<'PY'
+import json, sys
+root, base = sys.argv[1:3]
+path = f"{root}/.grov/stack.json"
+with open(path) as f:
+    d = json.load(f)
+if base:
+    d["base"] = base
+else:
+    d.pop("base", None)
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+resolve_base() {
+  local root=$1
+  local b
+  b=$(stack_get_base "$root")
+  if [[ -z "$b" ]]; then
+    b=$(cat "$root/.grov/primary-branch" 2>/dev/null) || true
+  fi
+  echo "$b"
+}
+
+stack_get_parent() {
+  local root=$1
+  local child=$2
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$child" <<'PY'
+import json, sys
+root, ch = sys.argv[1:3]
+with open(f"{root}/.grov/stack.json") as f:
+    d = json.load(f)
+nodes = d.get("nodes") or {}
+print(nodes.get(ch, {}).get("parent") or "")
+PY
+}
+
+# Record new stacked branch after grov add/checkout -b (parent = linked worktree HEAD).
+stack_record_new_branch() {
+  local root=$1
+  local child_branch=$2
+  local worktree_dir=$3
+  local linked
+  linked=$(get_linked_branch "$root" 2>/dev/null) || true
+  [[ -z "$linked" ]] && return 0
+  local pwt
+  pwt="$root/$BRANCHES_DIR_NAME/$linked"
+  [[ ! -d "$pwt" ]] && return 0
+  local parent_git
+  parent_git=$(git -C "$pwt" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+  [[ -z "$parent_git" || "$parent_git" == "HEAD" ]] && return 0
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$child_branch" "$parent_git" "$worktree_dir" <<'PY'
+import json, sys
+root, child, parent, wt = sys.argv[1:5]
+path = f"{root}/.grov/stack.json"
+with open(path) as f:
+    d = json.load(f)
+nodes = d.setdefault("nodes", {})
+nodes[child] = {"parent": parent, "worktree_dir": wt}
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+stack_load_nodes_python() {
+  python3 - "$@" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    d = json.load(f)
+nodes = d.get("nodes") or {}
+for name in sorted(nodes.keys()):
+    meta = nodes[name]
+    p = meta.get("parent")
+    wt = meta.get("worktree_dir") or ""
+    print(f"{name}\t{p if p is not None else ''}\t{wt}")
+PY
+}
+
+stack_json_dump_nodes() {
+  local root=$1
+  stack_ensure_file "$root"
+  stack_load_nodes_python "$(stack_path "$root")"
+}
+
+stack_children_of() {
+  local root=$1
+  local parent=$2
+  stack_json_dump_nodes "$root" | while IFS=$'\t' read -r name p _; do
+    [[ "$p" == "$parent" ]] && echo "$name"
+  done
+}
+
+stack_has_children() {
+  local root=$1
+  local branch=$2
+  [[ -n $(stack_children_of "$root" "$branch") ]]
+}
+
+stack_remove_node() {
+  local root=$1
+  local branch=$2
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$branch" <<'PY'
+import json, sys
+root, br = sys.argv[1:3]
+path = f"{root}/.grov/stack.json"
+with open(path) as f:
+    d = json.load(f)
+nodes = d.setdefault("nodes", {})
+nodes.pop(br, None)
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+stack_set_parent() {
+  local root=$1
+  local child=$2
+  local new_parent=$3
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$child" "$new_parent" <<'PY'
+import json, sys
+root, child, newp = sys.argv[1:4]
+path = f"{root}/.grov/stack.json"
+with open(path) as f:
+    d = json.load(f)
+nodes = d.setdefault("nodes", {})
+if child not in nodes:
+    nodes[child] = {}
+nodes[child]["parent"] = newp
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+# Lines: folder<TAB>head_branch
+scan_worktrees_head() {
+  local root=$1
+  local dir wt_path head
+  dir="$root/$BRANCHES_DIR_NAME"
+  [[ ! -d "$dir" ]] && return 0
+  local d
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] || continue
+    wt_path=$(readlink -f "$d" 2>/dev/null || echo "$d")
+    [[ ! -d "$wt_path" ]] && continue
+    git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null || continue
+    head=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || head="?"
+    echo "$(basename "$d")"$'\t'"$head"
+  done | sort
+}
 
 get_primary_dir() {
   local root=$1
@@ -68,6 +273,17 @@ get_linked_branch() {
   basename "$target"
 }
 
+# Git branch name checked out in linked workspace (may differ from linked folder basename).
+get_linked_git_branch() {
+  local root=$1
+  local folder wt_path
+  folder=$(get_linked_branch "$root") || return 1
+  [[ -z "$folder" ]] && return 1
+  wt_path=$(get_worktree_path "$root" "$folder")
+  [[ ! -d "$wt_path" ]] && return 1
+  git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+
 get_current_branch_from_cwd() {
   local root=$1
   local branches="$root/$BRANCHES_DIR_NAME"
@@ -93,20 +309,22 @@ list_branch_dirs() {
 }
 
 usage() {
-  echo "Usage: grov <init|checkout|switch|add|status|remove|root|branch|branches|path|restore|scripts> [args...]"
-  echo "  init                    convert current git repo to grov layout"
-  echo "  restore                 convert grov project back to normal git repo (linked branch at root)"
-  echo "  checkout [-b] <branch>  ensure worktree exists, point workspace at it"
-  echo "  switch <branch>         point workspace at existing worktree only"
-  echo "  add [-b] <branch>      create worktree only (no link change)"
-  echo "  status                  list worktrees and linked branch with git state"
-  echo "  remove <branch>         remove a worktree"
-  echo "  root                    print grov project root"
-  echo "  branch                  print active (linked) branch name"
-  echo "  branches                list worktree branch names"
-  echo "  path [branch]           print active workspace path, or path to branch worktree"
-  echo "  scripts                 list custom scripts in .grov/scripts"
-  echo "  <name>                  run .grov/scripts/<name> if present"
+  echo "Usage: grov <command> [args...]"
+  echo "  init                     convert current git repo to grov layout"
+  echo "  restore                  convert grov project back to normal git repo"
+  echo "  checkout [-b] <branch>   ensure worktree exists, point workspace at it"
+  echo "  switch <branch>          point workspace at existing worktree only"
+  echo "  add [-b] <branch>        create worktree only (no link change)"
+  echo "  status                   list worktrees, stack tree, git state"
+  echo "  remove <branch>          remove worktree (stack branch must be a leaf)"
+  echo "  restack [--continue|--abort]   rebase stacked branches (parent order)"
+  echo "  push [--yes] [--dry-run] [--from <branch>]   push subtree with --force-with-lease"
+  echo "  parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (default parent=base)"
+  echo "  base [<branch>]          show or set the global base (trunk) branch"
+  echo "  stack remove <branch>    remove stack leaf + worktree"
+  echo "  stack doctor             validate stack.json vs branches/"
+  echo "  root | branch | branches | path | scripts"
+  echo "  run <name> [args...]     run .grov/scripts/<name>"
   exit 1
 }
 
@@ -156,6 +374,7 @@ ensure_worktree() {
         [[ -z "$src" ]] && src="HEAD"
         git --git-dir="$bare" worktree add -b "$branch" "$wt_path" "$src"
         echo "Created branch '$branch' and worktree at $wt_path"
+        stack_record_new_branch "$root" "$branch" "$branch"
       else
         local ref
         ref=$(resolve_branch_ref "$root" "$branch") || {
@@ -188,6 +407,7 @@ ensure_worktree() {
       [[ -z "$src" ]] && echo "Error: workspace not linked; cannot use -b." >&2 && exit 1
       git -C "$repo" worktree add -b "$branch" "$wt_path" "$src"
       echo "Created branch '$branch' from '$src' and worktree at $wt_path"
+      stack_record_new_branch "$root" "$branch" "$branch"
     else
       local ref
       ref=$(resolve_branch_ref "$root" "$branch") || {
@@ -231,6 +451,8 @@ cmd_init() {
     mv "$root/$f" "$root/.grov/old-checkout/$f"
   done
   git init --bare "$BARE_REPO"
+  git --git-dir="$root/$BARE_REPO" config rerere.enabled true
+  git --git-dir="$root/$BARE_REPO" config rerere.autoupdate true
   (cd "$root" && git remote add _dev_bare "$(pwd)/$BARE_REPO" && git push _dev_bare --all && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
   # Copy remotes from original repo into bare so fetch/push still work
   while IFS= read -r name; do
@@ -255,6 +477,7 @@ cmd_init() {
   ln -sfn "$BRANCHES_DIR_NAME/$branch_dir" "$link_path"
   find "$root" -mindepth 1 -maxdepth 1 ! -name .grov ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
   rm -rf "$root/.git"
+  printf '%s\n' '{"version":1,"nodes":{}}' >"$root/$STACK_JSON"
   echo "Untracked files from previous working tree. Refs in .grov/repo.git; worktree at branches/$branch_dir" > "$root/.grov/old-checkout/README.txt"
   echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .grov/old-checkout."
 }
@@ -342,11 +565,58 @@ cmd_scripts() {
   done | sort
 }
 
+cmd_run() {
+  local root=$1
+  shift
+  local name="${1:-}"
+  [[ -z "$name" ]] && echo "Usage: grov run <name> [args...]" >&2 && exit 1
+  shift
+  local script_path="$root/.grov/scripts/$name"
+  if [[ ! -e "$script_path" ]]; then
+    echo "Error: No script at $script_path" >&2
+    exit 1
+  fi
+  if [[ ! -x "$script_path" ]]; then
+    echo "Script exists but is not executable: $script_path" >&2
+    echo -n "Make it executable? [y/N] " >&2
+    read -r ans
+    [[ "$ans" != [yY]* ]] && exit 1
+    chmod +x "$script_path"
+  fi
+  export GROV_ROOT="$root"
+  exec "$script_path" "$@"
+}
+
 cmd_remove() {
   local root=$1
   shift
   local branch="$1"
   [[ -z "$branch" ]] && echo "Usage: grov remove <branch>" >&2 && exit 1
+  stack_ensure_file "$root"
+  local stack_file
+  stack_file=$(stack_path "$root")
+  if [[ -f "$stack_file" ]]; then
+    set +e
+    python3 - "$root" "$branch" <<'PY'
+import json, sys
+root, br = sys.argv[1:3]
+with open(f"{root}/.grov/stack.json") as f:
+    d = json.load(f)
+nodes = d.get("nodes") or {}
+if br in nodes:
+    for _, meta in nodes.items():
+        if meta.get("parent") == br:
+            sys.exit(2)
+sys.exit(0)
+PY
+    rc=$?
+    set -e
+    if [[ "$rc" -eq 2 ]]; then
+      echo "Error: Branch '$branch' has stacked children. Reparent (grov parent) or remove children first (see grov status)." >&2
+      exit 1
+    fi
+    [[ "$rc" -ne 0 ]] && exit "$rc"
+  fi
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
   if [[ ! -d "$wt_path" ]]; then
@@ -364,49 +634,704 @@ cmd_remove() {
     fi
     git -C "$root/$BRANCHES_DIR_NAME/$primary_dir" worktree remove "$wt_path"
   fi
+  stack_remove_node "$root" "$branch" 2>/dev/null || true
   echo "Removed worktree: $branch"
+}
+
+git_state_line() {
+  local wt_path=$1
+  local linked=$2
+  local folder=$3
+  local marker=""
+  [[ "$folder" == "$linked" ]] && marker=" (linked)"
+  local state=""
+  local rb="" gp
+  gp=$(git -C "$wt_path" rev-parse --git-path rebase-merge 2>/dev/null || true)
+  if [[ -n "$gp" && -d "$gp" ]]; then rb=" rebase-in-progress"; fi
+  if [[ -z "$rb" ]]; then
+    gp=$(git -C "$wt_path" rev-parse --git-path rebase-apply 2>/dev/null || true)
+    [[ -n "$gp" && -d "$gp" ]] && rb=" rebase-in-progress"
+  fi
+  if git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null; then
+    if [[ -n $(git -C "$wt_path" status -s 2>/dev/null) ]]; then
+      state="uncommitted"
+    else
+      local ahead behind
+      ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
+      behind=$(git -C "$wt_path" rev-list --count HEAD..@{u} 2>/dev/null || echo "0")
+      if [[ "$ahead" != "0" || "$behind" != "0" ]]; then
+        state="ahead $ahead, behind $behind"
+      else
+        state="clean"
+      fi
+    fi
+  else
+    state="?"
+  fi
+  echo "  $folder$marker  $state$rb"
 }
 
 cmd_status() {
   local root=$1
   ensure_workspace "$root" || true
+  stack_ensure_file "$root"
+  require_python3
   local link_path="$root/$LINK_NAME"
   local linked=""
   if [[ -L "$link_path" ]]; then
     linked=$(basename "$(readlink "$link_path")")
   fi
-  echo "Linked: ${linked:-none}"
-  echo ""
+  local base
+  base=$(stack_get_base "$root" 2>/dev/null) || true
+  if [[ -z "$base" ]]; then
+    base=$(cat "$root/.grov/primary-branch" 2>/dev/null) || true
+  fi
+  local color="0"
+  [[ -t 1 && -z "$NO_COLOR" ]] && color="1"
+  python3 - "$root" "$linked" "$base" "$color" <<'PY'
+import json, os, re, subprocess, sys
 
-  local branch
-  while IFS= read -r branch; do
-    [[ -z "$branch" ]] && continue
-    local wt_path
-    wt_path=$(get_worktree_path "$root" "$branch")
-    [[ ! -d "$wt_path" ]] && continue
+root, linked, base = sys.argv[1], sys.argv[2], sys.argv[3]
+use_color = sys.argv[4] == "1"
 
-    local marker=""
-    [[ "$branch" == "$linked" ]] && marker=" (linked)"
+BOLD, DIM, GREEN, YELLOW, CYAN, RED = "1", "2", "32", "33", "36", "31"
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
-    local state=""
-    if git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null; then
-      if [[ -n $(git -C "$wt_path" status -s 2>/dev/null) ]]; then
-        state="uncommitted"
-      else
-        local ahead behind
-        ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
-        behind=$(git -C "$wt_path" rev-list --count HEAD..@{u} 2>/dev/null || echo "0")
-        if [[ "$ahead" != "0" || "$behind" != "0" ]]; then
-          state="ahead $ahead, behind $behind"
-        else
-          state="clean"
-        fi
-      fi
-    else
-      state="?"
+def c(code, text):
+    if not use_color or not text:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+def vlen(s):
+    return len(ANSI_RE.sub("", s))
+
+def get_state(wt):
+    for sub in ("rebase-merge", "rebase-apply"):
+        try:
+            gp = subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", "--git-path", sub],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            gp = ""
+        if gp and os.path.isdir(gp):
+            return ("rebasing", "rebase in progress")
+    try:
+        s = subprocess.check_output(
+            ["git", "-C", wt, "status", "-s"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+    except subprocess.CalledProcessError:
+        return ("unknown", "?")
+    if s.strip():
+        return ("dirty", "uncommitted")
+    try:
+        ahead = int(subprocess.check_output(
+            ["git", "-C", wt, "rev-list", "--count", "@{u}..HEAD"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip() or "0")
+        behind = int(subprocess.check_output(
+            ["git", "-C", wt, "rev-list", "--count", "HEAD..@{u}"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip() or "0")
+    except subprocess.CalledProcessError:
+        return ("noupstream", "no upstream")
+    if ahead or behind:
+        parts = []
+        if ahead: parts.append(f"\u2191{ahead}")
+        if behind: parts.append(f"\u2193{behind}")
+        return ("diverged", " ".join(parts))
+    return ("clean", "clean")
+
+def colorize_state(code, text):
+    if code == "clean":      return c(GREEN, text)
+    if code == "dirty":      return c(YELLOW, text)
+    if code == "diverged":   return c(CYAN, text)
+    if code == "rebasing":   return c(RED, text)
+    if code == "noupstream": return c(DIM, text)
+    return text
+
+branches_dir = os.path.join(root, "branches")
+folder_to_head = {}
+folder_state = {}
+if os.path.isdir(branches_dir):
+    for name in sorted(os.listdir(branches_dir)):
+        p = os.path.join(branches_dir, name)
+        if not os.path.isdir(p):
+            continue
+        wt = os.path.realpath(p)
+        try:
+            h = subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            h = "?"
+        folder_to_head[name] = h
+        try:
+            folder_state[name] = get_state(wt)
+        except Exception:
+            folder_state[name] = ("unknown", "?")
+
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = (json.load(f).get("nodes") or {})
+
+stack_branches = set(nodes.keys())
+stack_roots = sorted(
+    [b for b, m in nodes.items() if (m.get("parent") or "") not in stack_branches]
+)
+trunks_seen = set()
+trunks = []
+for rt in stack_roots:
+    par = nodes[rt].get("parent") or ""
+    if par and par not in trunks_seen:
+        trunks.append(par)
+        trunks_seen.add(par)
+headless_roots = [r for r in stack_roots if not (nodes[r].get("parent") or "")]
+displayed_branches = stack_branches | set(trunks)
+
+def find_folder(branch):
+    for fd, h in folder_to_head.items():
+        if h == branch:
+            return fd
+    return None
+
+def children_of(name):
+    if name in stack_branches:
+        return sorted([k for k, m in nodes.items() if m.get("parent") == name])
+    if name in trunks_seen:
+        return sorted(
+            [r for r in stack_roots if (nodes[r].get("parent") or "") == name]
+        )
+    return []
+
+items = []
+
+def fmt_row(name, prefix, is_orphan):
+    if is_orphan:
+        folder = name
+        head = folder_to_head.get(name, "?")
+    else:
+        folder = find_folder(name)
+        head = name
+    is_linked = folder is not None and folder == linked
+    name_disp = c(BOLD, name) if is_linked else name
+    marker = " " + c(GREEN, "\u25cf") if is_linked else ""
+    suffix = ""
+    if not is_orphan and folder and folder != name:
+        suffix = " " + c(DIM, f"[wt: {folder}]")
+    if is_orphan and head != "?" and head != name:
+        suffix = " " + c(DIM, f"[head: {head}]")
+    left = f"{c(DIM, prefix)}{name_disp}{marker}{suffix}"
+    if folder is None or folder not in folder_state:
+        right = c(DIM, "(no worktree)")
+    else:
+        sc, st = folder_state[folder]
+        right = colorize_state(sc, st)
+    return left, right
+
+INDENT = "  "
+
+def render(name, prefix_for_this, prefix_for_kids):
+    left, right = fmt_row(name, prefix_for_this, is_orphan=False)
+    items.append(("row", left, right))
+    kids = children_of(name)
+    for i, k in enumerate(kids):
+        last = i == len(kids) - 1
+        connector = "\u2514\u2500\u2500 " if last else "\u251c\u2500\u2500 "
+        ext = "    " if last else "\u2502   "
+        render(k, prefix_for_kids + connector, prefix_for_kids + ext)
+
+linked_disp = c(BOLD, linked) if linked else c(DIM, "(none)")
+items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}"))
+if base:
+    items.append(("text", f"{c(DIM, 'Base:  ')} {base}"))
+items.append(("blank",))
+
+items.append(("section", "Stack"))
+if not nodes:
+    items.append(("dim", f"{INDENT}(empty)"))
+else:
+    for trunk in trunks:
+        render(trunk, INDENT, INDENT)
+    for r in headless_roots:
+        render(r, INDENT, INDENT)
+
+orphan_folders = [
+    fd for fd, h in folder_to_head.items()
+    if h not in displayed_branches and fd not in displayed_branches
+]
+if orphan_folders:
+    items.append(("blank",))
+    items.append(("section", "Orphans"))
+    for fd in sorted(orphan_folders):
+        left, right = fmt_row(fd, INDENT, is_orphan=True)
+        items.append(("row", left, right))
+
+maxw = 0
+for it in items:
+    if it[0] == "row" and vlen(it[1]) > maxw:
+        maxw = vlen(it[1])
+
+for it in items:
+    kind = it[0]
+    if kind == "row":
+        _, l, r = it
+        pad = " " * (maxw - vlen(l) + 4)
+        print(f"{l}{pad}{r}")
+    elif kind == "section":
+        title = it[1]
+        print(c(BOLD, title))
+        print(c(DIM, "\u2500" * len(title)))
+    elif kind == "blank":
+        print()
+    elif kind == "dim":
+        print(c(DIM, it[1]))
+    elif kind == "text":
+        print(it[1])
+PY
+}
+
+find_rebase_worktrees() {
+  local root=$1
+  local dir wt_path gp
+  dir="$root/$BRANCHES_DIR_NAME"
+  [[ ! -d "$dir" ]] && return 0
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] || continue
+    wt_path=$(readlink -f "$d" 2>/dev/null || echo "$d")
+    gp=$(git -C "$wt_path" rev-parse --git-path rebase-merge 2>/dev/null || true)
+    if [[ -n "$gp" && -d "$gp" ]]; then
+      echo "$wt_path"
+      continue
     fi
-    echo "  $branch$marker  $state"
-  done < <(list_branch_dirs "$root")
+    gp=$(git -C "$wt_path" rev-parse --git-path rebase-apply 2>/dev/null || true)
+    [[ -n "$gp" && -d "$gp" ]] && echo "$wt_path"
+  done
+}
+
+resolve_dirs_for_branch_head() {
+  local root=$1
+  local git_branch=$2
+  local line dirs="" n
+  dirs=""
+  n=0
+  while IFS=$'\t' read -r folder head; do
+    [[ "$head" == "$git_branch" ]] || continue
+    dirs="$folder $dirs"
+    n=$((n + 1))
+  done < <(scan_worktrees_head "$root")
+  echo "$n $dirs"
+}
+
+materialize_worktree_if_needed() {
+  local root=$1
+  local branch=$2
+  local info n d
+  info=$(resolve_dirs_for_branch_head "$root" "$branch")
+  n=${info%% *}
+  if [[ "$n" -eq 1 ]]; then return 0; fi
+  if [[ "$n" -gt 1 ]]; then
+    echo "Error: Multiple worktrees have HEAD=$branch; resolve manually." >&2
+    exit 1
+  fi
+  ensure_worktree "$root" false "$branch"
+}
+
+restack_order_and_rebase() {
+  local root=$1
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" <<'PY'
+import json, os, subprocess, sys
+
+root = sys.argv[1]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+if not nodes:
+    print("Nothing in stack.", file=sys.stderr)
+    sys.exit(0)
+
+names = list(nodes.keys())
+
+def depth(b):
+    if b not in nodes:
+        return 0
+    d, cur, seen = 0, b, set()
+    while cur in nodes and cur not in seen:
+        seen.add(cur)
+        p = nodes[cur].get("parent")
+        if not p or p not in nodes:
+            break
+        d += 1
+        cur = p
+    return d
+
+ordered = sorted(names, key=lambda b: (depth(b), b))
+for b in ordered:
+    meta = nodes[b]
+    par = meta.get("parent")
+    if not par:
+        continue
+    print(f"{b}\t{par}")
+PY
+}
+
+cmd_restack() {
+  local root=$1
+  shift
+  if [[ "$1" == "--continue" ]]; then
+    cmd_restack_continue "$root"
+    return
+  fi
+  if [[ "$1" == "--abort" ]]; then
+    cmd_restack_abort "$root"
+    return
+  fi
+  [[ $# -gt 0 ]] && echo "Usage: grov restack [--continue|--abort]" >&2 && exit 1
+
+  local line child parent wt mapfile_order
+  mapfile -t mapfile_order < <(restack_order_and_rebase "$root")
+  if [[ ${#mapfile_order[@]} -eq 0 ]]; then
+    echo "Nothing to restack."
+    return 0
+  fi
+  for line in "${mapfile_order[@]}"; do
+    IFS=$'\t' read -r child parent <<<"$line"
+    [[ -z "$child" ]] && continue
+    materialize_worktree_if_needed "$root" "$child"
+    wt=""
+    wt=$(resolve_dirs_for_branch_head "$root" "$child")
+    wt=${wt#* }
+    wt=$(echo "$wt" | awk '{print $1}')
+    [[ -z "$wt" ]] && {
+      echo "Error: Could not resolve worktree for branch $child" >&2
+      exit 1
+    }
+    wt_path=$(get_worktree_path "$root" "$wt")
+    wt_path=$(readlink -f "$wt_path")
+    echo "Restack: $child onto $parent (in $wt_path)"
+    if git -C "$wt_path" rebase "$parent"; then
+      :
+    else
+      echo "" >&2
+      echo "Rebase conflict while restacking branch '$child'." >&2
+      echo "Resolve in: $wt_path" >&2
+      echo "Then run: grov restack --continue   (or: git -C \"$wt_path\" rebase --continue)" >&2
+      exit 1
+    fi
+  done
+  echo "Restack complete."
+}
+
+cmd_restack_continue() {
+  local root=$1
+  local list wt n
+  mapfile -t list < <(find_rebase_worktrees "$root")
+  n=${#list[@]}
+  if [[ "$n" -eq 0 ]]; then
+    echo "Error: No rebase in progress in any branches/* worktree." >&2
+    exit 1
+  fi
+  if [[ "$n" -gt 1 ]]; then
+    echo "Error: Multiple rebases in progress; resolve one at a time." >&2
+    printf '%s\n' "${list[@]}" >&2
+    exit 1
+  fi
+  wt="${list[0]}"
+  git -C "$wt" rebase --continue
+}
+
+cmd_restack_abort() {
+  local root=$1
+  local list wt n
+  mapfile -t list < <(find_rebase_worktrees "$root")
+  n=${#list[@]}
+  if [[ "$n" -eq 0 ]]; then
+    echo "Error: No rebase in progress in any branches/* worktree." >&2
+    exit 1
+  fi
+  if [[ "$n" -gt 1 ]]; then
+    echo "Error: Multiple rebases in progress." >&2
+    exit 1
+  fi
+  wt="${list[0]}"
+  git -C "$wt" rebase --abort
+}
+
+collect_subtree_branches() {
+  local root=$1
+  local start=$2
+  require_python3
+  python3 - "$root" "$start" <<'PY'
+import json, os, sys, collections
+
+root, start = sys.argv[1:3]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+
+if start not in nodes:
+    print(start)
+    sys.exit(0)
+
+children = collections.defaultdict(list)
+for b, m in nodes.items():
+    p = m.get("parent")
+    if p:
+        children[p].append(b)
+
+seen = set()
+q = collections.deque([start])
+out = []
+while q:
+    b = q.popleft()
+    if b in seen:
+        continue
+    seen.add(b)
+    out.append(b)
+    for c in sorted(children.get(b, [])):
+        q.append(c)
+
+def depth(b):
+    if b not in nodes:
+        return 0
+    p = nodes[b].get("parent")
+    if not p or p not in nodes:
+        return 0
+    return 1 + depth(p)
+
+# push parents before children => smaller depth first
+for b in sorted(seen, key=lambda x: (depth(x), x)):
+    print(b)
+PY
+}
+
+cmd_push() {
+  local root=$1
+  shift
+  local yes=false dry=false
+  local from_branch=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=true ;;
+      --dry-run) dry=true ;;
+      --from)
+        shift
+        from_branch="${1:-}"
+        [[ -z "$from_branch" ]] && echo "Usage: grov push [--yes] [--dry-run] [--from <branch>]" >&2 && exit 1
+        ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+  stack_ensure_file "$root"
+  require_python3
+  [[ -z "$from_branch" ]] && from_branch=$(get_linked_git_branch "$root" || true)
+  [[ -z "$from_branch" ]] && from_branch=$(get_linked_branch "$root" || true)
+  [[ -z "$from_branch" ]] && {
+    echo "Error: No linked branch; pass --from <branch>." >&2
+    exit 1
+  }
+
+  local br wt_path ahead behind
+  echo "Push subtree from '$from_branch' (ordered parent-before-child):"
+  while IFS= read -r br; do
+    [[ -z "$br" ]] && continue
+    materialize_worktree_if_needed "$root" "$br"
+    wt_path=""
+    local info n d
+    info=$(resolve_dirs_for_branch_head "$root" "$br")
+    n=${info%% *}
+    d=${info#* }
+    wt_path=$(get_worktree_path "$root" "${d%% *}")
+    wt_path=$(readlink -f "$wt_path" 2>/dev/null || echo "$wt_path")
+    ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
+    if ! git -C "$wt_path" rev-parse @{u} &>/dev/null; then
+      echo "  $br: no upstream — skipped (set upstream first)"
+      continue
+    fi
+    if [[ "$ahead" == "0" ]]; then
+      echo "  $br: nothing to push"
+      continue
+    fi
+    echo "  $br: ahead $ahead (push with --force-with-lease)"
+    if [[ "$dry" == true ]]; then
+      echo "    dry-run: git push --force-with-lease origin $br"
+      continue
+    fi
+    if [[ "$yes" != true ]]; then
+      echo -n "    Push $br? [y/N] "
+      read -r ans
+      [[ "$ans" != [yY]* ]] && continue
+    fi
+    git -C "$wt_path" push --force-with-lease origin "$br"
+  done < <(collect_subtree_branches "$root" "$from_branch")
+}
+
+cmd_parent() {
+  local root=$1
+  shift
+  local yes=false
+  local skip_rebase=false
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) yes=true ;;
+      --no-rebase) skip_rebase=true ;;
+      -*) echo "Unknown option: $1" >&2; exit 1 ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  local child="${positional[0]:-}"
+  local newp="${positional[1]:-}"
+  [[ -z "$child" ]] && echo "Usage: grov parent <child> [<parent>] [--yes] [--no-rebase]" >&2 && exit 1
+  stack_ensure_file "$root"
+
+  if [[ -z "$newp" ]]; then
+    newp=$(resolve_base "$root")
+    [[ -z "$newp" ]] && {
+      echo "Error: No parent given and no base set. Use: grov base <branch>" >&2
+      exit 1
+    }
+  fi
+
+  [[ "$child" == "$newp" ]] && echo "Error: child and parent are the same ($child)." >&2 && exit 1
+
+  resolve_branch_ref "$root" "$child" >/dev/null || {
+    echo "Error: Branch '$child' not found." >&2
+    exit 1
+  }
+  resolve_branch_ref "$root" "$newp" >/dev/null || {
+    echo "Error: Parent branch '$newp' not found." >&2
+    exit 1
+  }
+
+  local oldp
+  oldp=$(stack_get_parent "$root" "$child")
+
+  if [[ -n "$oldp" && "$oldp" == "$newp" ]]; then
+    echo "$child already has parent '$newp'. Nothing to do."
+    return 0
+  fi
+
+  if [[ -n "$oldp" && "$yes" != true ]]; then
+    echo -n "Switch parent of '$child' from '$oldp' to '$newp'? [y/N] "
+    read -r ans
+    [[ "$ans" != [yY]* ]] && { echo "Aborted."; exit 1; }
+  fi
+
+  stack_set_parent "$root" "$child" "$newp"
+
+  if [[ -z "$oldp" ]]; then
+    echo "Added '$child' to stack with parent '$newp'."
+  else
+    echo "Reparented '$child': $oldp -> $newp"
+  fi
+
+  if [[ "$skip_rebase" == true ]]; then
+    echo "Skipping rebase. Run 'grov restack' later if needed."
+    return 0
+  fi
+
+  materialize_worktree_if_needed "$root" "$child"
+  local info wt_folder wt_path
+  info=$(resolve_dirs_for_branch_head "$root" "$child")
+  wt_folder=${info#* }
+  wt_folder=${wt_folder%% *}
+  wt_path=$(readlink -f "$(get_worktree_path "$root" "$wt_folder")")
+
+  if [[ -n "$oldp" ]]; then
+    if git -C "$wt_path" rebase --onto "$newp" "$oldp"; then
+      echo "Rebase complete."
+    else
+      echo "Conflict during rebase. Resolve in: $wt_path" >&2
+      echo "Then: grov restack --continue" >&2
+      exit 1
+    fi
+  else
+    if git -C "$wt_path" rebase "$newp"; then
+      echo "Rebase complete."
+    else
+      echo "Conflict during rebase. Resolve in: $wt_path" >&2
+      exit 1
+    fi
+  fi
+}
+
+cmd_base() {
+  local root=$1
+  shift
+  local new_base="${1:-}"
+  if [[ -z "$new_base" ]]; then
+    local b
+    b=$(stack_get_base "$root")
+    if [[ -n "$b" ]]; then
+      echo "$b"
+    else
+      local fallback
+      fallback=$(cat "$root/.grov/primary-branch" 2>/dev/null) || true
+      if [[ -n "$fallback" ]]; then
+        echo "$fallback (default; not explicitly set)"
+      else
+        echo "(not set)"
+      fi
+    fi
+    return 0
+  fi
+  resolve_branch_ref "$root" "$new_base" >/dev/null || {
+    echo "Error: Branch '$new_base' not found." >&2
+    exit 1
+  }
+  stack_set_base "$root" "$new_base"
+  echo "Base set to '$new_base'."
+}
+
+cmd_stack_remove() {
+  local root=$1
+  shift
+  local branch="$1"
+  [[ -z "$branch" ]] && echo "Usage: grov stack remove <branch>" >&2 && exit 1
+  stack_has_children "$root" "$branch" && {
+    echo "Error: '$branch' is not a leaf (has children in stack)." >&2
+    exit 1
+  }
+  cmd_remove "$root" "$branch"
+}
+
+cmd_stack_doctor() {
+  local root=$1
+  stack_ensure_file "$root"
+  require_python3
+  python3 - "$root" <<'PY'
+import json, os, subprocess, sys
+
+root = sys.argv[1]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    d = json.load(f)
+nodes = d.get("nodes") or {}
+print("stack.json OK; nodes:", len(nodes))
+scan = {}
+for name in sorted(os.listdir(os.path.join(root, "branches"))):
+    p = os.path.join(root, "branches", name)
+    if not os.path.isdir(p):
+        continue
+    try:
+        h = subprocess.check_output(
+            ["git", "-C", p, "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ).strip()
+    except subprocess.CalledProcessError:
+        h = "?"
+    scan[name] = h
+
+for b, meta in sorted(nodes.items()):
+    hint = meta.get("worktree_dir") or ""
+    folders = [fd for fd, h in scan.items() if h == b]
+    if len(folders) != 1 and hint:
+        print(f"- {b}: hint dir '{hint}', scan folders for HEAD={b}: {folders}")
+    elif not folders:
+        print(f"- {b}: no local worktree (ok)")
+PY
 }
 
 cmd_restore() {
@@ -431,7 +1356,6 @@ cmd_restore() {
     echo "Error: Clone from bare failed." >&2
     exit 1
   }
-  # Point clone's remotes at the real URLs, not the removed bare repo (clone only has origin → bare path)
   local bare="$root/$BARE_REPO"
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
@@ -446,14 +1370,12 @@ cmd_restore() {
       done
     fi
   done < <(git --git-dir="$bare" remote 2>/dev/null)
-  # Leave root so rm can remove .grov, branches, workspace (rm may fail if cwd is inside them)
   cd /tmp 2>/dev/null || cd "$root/.." || true
   rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME" || {
     echo "Error: Failed to remove .grov, branches, or workspace." >&2
     rm -rf "$tmp"
     exit 1
   }
-  # Clear any other root content so mv from tmp doesn't nest duplicates
   for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [[ -e "$f" && "$f" != "$tmp" ]] && rm -rf "$f"
   done
@@ -480,38 +1402,39 @@ _raw_root=$(find_dev_root) || {
 }
 GROV_ROOT=$(cd "${_raw_root%%[[:space:]]*}" && pwd)
 
+if [[ "$cmd" == "stack" ]]; then
+  sub="${1:-}"
+  shift || true
+  case "$sub" in
+    remove) cmd_stack_remove "$GROV_ROOT" "$@" ;;
+    doctor) cmd_stack_doctor "$GROV_ROOT" ;;
+    "") echo "Usage: grov stack remove <branch> | grov stack doctor" >&2; exit 1 ;;
+    *) echo "Unknown stack subcommand: $sub" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+
 case "$cmd" in
   checkout)   cmd_checkout "$GROV_ROOT" "$@" ;;
   switch)     cmd_switch "$GROV_ROOT" "$@" ;;
   add)        cmd_add "$GROV_ROOT" "$@" ;;
   status)     cmd_status "$GROV_ROOT" "$@" ;;
   remove)     cmd_remove "$GROV_ROOT" "$@" ;;
+  restack)    cmd_restack "$GROV_ROOT" "$@" ;;
+  push)       cmd_push "$GROV_ROOT" "$@" ;;
+  parent)     cmd_parent "$GROV_ROOT" "$@" ;;
+  base)       cmd_base "$GROV_ROOT" "$@" ;;
   root)       cmd_root "$GROV_ROOT" ;;
   branch)     cmd_branch "$GROV_ROOT" ;;
   branches)   cmd_branches "$GROV_ROOT" ;;
   path)       cmd_path "$GROV_ROOT" "$@" ;;
   restore)    cmd_restore "$GROV_ROOT" ;;
   scripts)    cmd_scripts "$GROV_ROOT" ;;
+  run)        cmd_run "$GROV_ROOT" "$@" ;;
   "")
     usage
     ;;
   *)
-    script_path="$GROV_ROOT/.grov/scripts/$cmd"
-    if [[ -x "$script_path" && -f "$script_path" ]]; then
-      export GROV_ROOT
-      exec "$script_path" "$@"
-    fi
-    if [[ -f "$script_path" ]]; then
-      echo "Script exists but is not executable: $script_path" >&2
-      echo -n "Make it executable? [y/N] " >&2
-      read -r ans
-      if [[ "$ans" == [yY]* ]]; then
-        chmod +x "$script_path"
-        export GROV_ROOT
-        exec "$script_path" "$@"
-      fi
-      exit 1
-    fi
     echo "Unknown command: $cmd" >&2
     usage
     ;;

@@ -81,13 +81,9 @@ _grov_list_scripts() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout switch add status remove root branch branches path scripts"
-  local scripts
-  scripts=$(_grov_list_scripts 2>/dev/null)
-  local all_commands
-  all_commands=$(echo "$commands $scripts" | tr ' \n' ' ')
+  local commands="init restore checkout switch add status remove restack push parent base stack root branch branches path scripts run"
   if [[ $cword -eq 1 ]]; then
-    COMPREPLY=($(compgen -W "$all_commands" -- "$cur"))
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     return
   fi
   local cmd=${words[1]}
@@ -117,7 +113,37 @@ _grov() {
       fi
       ;;
     status) ;;
+    restack)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "--continue --abort" -- "$cur"))
+      ;;
+    push)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "--yes --dry-run --from" -- "$cur"))
+      elif [[ "$prev" == "--from" ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      fi
+      ;;
+    parent)
+      case "$prev" in
+        parent) COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur")) ;;
+        --yes|--no-rebase) COMPREPLY=($(compgen -W "$(_grov_list_git_branches) --yes --no-rebase" -- "$cur")) ;;
+        *) COMPREPLY=($(compgen -W "$(_grov_list_git_branches) --yes --no-rebase" -- "$cur")) ;;
+      esac
+      ;;
+    base)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      ;;
+    stack)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "remove doctor" -- "$cur"))
+      elif [[ $cword -eq 3 && "${words[2]}" == "remove" ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      fi
+      ;;
     scripts) ;;
+    run)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_scripts)" -- "$cur"))
+      ;;
     remove)
       [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
       ;;
