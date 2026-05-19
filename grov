@@ -1174,7 +1174,7 @@ cmd_push() {
       local remote="origin"
       if [[ "$yes" != true ]]; then
         echo -n "  $br: no upstream. Push --set-upstream to remote [origin]: "
-        read -r remote_input
+        read -r remote_input </dev/tty
         [[ -n "$remote_input" ]] && remote="$remote_input"
       fi
       if [[ "$dry" == true ]]; then
@@ -1197,7 +1197,7 @@ cmd_push() {
     fi
     if [[ "$yes" != true ]]; then
       echo -n "    Push $br? [y/N] "
-      read -r ans
+      read -r ans </dev/tty
       [[ "$ans" != [yY]* ]] && continue
     fi
     git -C "$wt_path" push --force-with-lease origin "$br"
