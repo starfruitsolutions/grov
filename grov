@@ -705,7 +705,7 @@ def c(code, text):
 def vlen(s):
     return len(ANSI_RE.sub("", s))
 
-def get_state(wt):
+def get_state(wt, compare_to=None):
     for sub in ("rebase-merge", "rebase-apply"):
         try:
             gp = subprocess.check_output(
@@ -725,41 +725,67 @@ def get_state(wt):
         return ("unknown", "?")
     if s.strip():
         return ("dirty", "uncommitted")
+    ref = compare_to if compare_to else "@{u}"
     try:
         ahead = int(subprocess.check_output(
-            ["git", "-C", wt, "rev-list", "--count", "@{u}..HEAD"],
+            ["git", "-C", wt, "rev-list", "--count", f"{ref}..HEAD"],
             stderr=subprocess.DEVNULL, text=True
         ).strip() or "0")
         behind = int(subprocess.check_output(
-            ["git", "-C", wt, "rev-list", "--count", "HEAD..@{u}"],
+            ["git", "-C", wt, "rev-list", "--count", f"HEAD..{ref}"],
             stderr=subprocess.DEVNULL, text=True
         ).strip() or "0")
     except subprocess.CalledProcessError:
+        if compare_to:
+            return ("unknown", "?")
         return ("noupstream", "no upstream")
-    if ahead or behind:
+    if not (ahead or behind):
+        return ("clean", "clean")
+    if not compare_to:
         parts = []
         if ahead: parts.append(f"\u2191{ahead}")
         if behind: parts.append(f"\u2193{behind}")
         return ("diverged", " ".join(parts))
-    return ("clean", "clean")
+    ins = dels = 0
+    if ahead:
+        try:
+            shortstat = subprocess.check_output(
+                ["git", "-C", wt, "diff", "--shortstat", f"{compare_to}...HEAD"],
+                stderr=subprocess.DEVNULL, text=True
+            )
+            m = re.search(r"(\d+) insertion", shortstat)
+            if m: ins = int(m.group(1))
+            m = re.search(r"(\d+) deletion", shortstat)
+            if m: dels = int(m.group(1))
+        except subprocess.CalledProcessError:
+            pass
+    parts = [
+        c(CYAN,  f"\u2191{ahead}"),
+        c(CYAN,  f"\u2193{behind}"),
+        c(GREEN, f"+{ins}"),
+        c(RED,   f"-{dels}"),
+    ]
+    return ("preformatted", " ".join(parts))
 
 def colorize_state(code, text):
-    if code == "clean":      return c(GREEN, text)
-    if code == "dirty":      return c(YELLOW, text)
-    if code == "diverged":   return c(CYAN, text)
-    if code == "rebasing":   return c(RED, text)
-    if code == "noupstream": return c(DIM, text)
+    if code == "clean":        return c(GREEN, text)
+    if code == "dirty":        return c(YELLOW, text)
+    if code == "diverged":     return c(CYAN, text)
+    if code == "preformatted": return text
+    if code == "rebasing":     return c(RED, text)
+    if code == "noupstream":   return c(DIM, text)
     return text
 
 branches_dir = os.path.join(root, "branches")
 folder_to_head = {}
-folder_state = {}
+folder_paths = {}
 if os.path.isdir(branches_dir):
     for name in sorted(os.listdir(branches_dir)):
         p = os.path.join(branches_dir, name)
         if not os.path.isdir(p):
             continue
         wt = os.path.realpath(p)
+        folder_paths[name] = wt
         try:
             h = subprocess.check_output(
                 ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -768,10 +794,6 @@ if os.path.isdir(branches_dir):
         except subprocess.CalledProcessError:
             h = "?"
         folder_to_head[name] = h
-        try:
-            folder_state[name] = get_state(wt)
-        except Exception:
-            folder_state[name] = ("unknown", "?")
 
 with open(os.path.join(root, ".grov", "stack.json")) as f:
     nodes = (json.load(f).get("nodes") or {})
@@ -807,7 +829,7 @@ def children_of(name):
 
 items = []
 
-def fmt_row(name, prefix, is_orphan):
+def fmt_row(name, prefix, is_orphan, parent_name=None):
     if is_orphan:
         folder = name
         head = folder_to_head.get(name, "?")
@@ -816,31 +838,34 @@ def fmt_row(name, prefix, is_orphan):
         head = name
     is_linked = folder is not None and folder == linked
     name_disp = c(BOLD, name) if is_linked else name
-    marker = " " + c(GREEN, "\u25cf") if is_linked else ""
+    mark = c(GREEN, "\u25cf") if is_linked else " "
     suffix = ""
     if not is_orphan and folder and folder != name:
         suffix = " " + c(DIM, f"[wt: {folder}]")
     if is_orphan and head != "?" and head != name:
         suffix = " " + c(DIM, f"[head: {head}]")
-    left = f"{c(DIM, prefix)}{name_disp}{marker}{suffix}"
-    if folder is None or folder not in folder_state:
+    left = f"{mark}{c(DIM, prefix)}{name_disp}{suffix}"
+    if folder is None or folder not in folder_paths:
         right = c(DIM, "(no worktree)")
     else:
-        sc, st = folder_state[folder]
+        try:
+            sc, st = get_state(folder_paths[folder], compare_to=parent_name)
+        except Exception:
+            sc, st = ("unknown", "?")
         right = colorize_state(sc, st)
     return left, right
 
 INDENT = "  "
 
-def render(name, prefix_for_this, prefix_for_kids):
-    left, right = fmt_row(name, prefix_for_this, is_orphan=False)
+def render(name, prefix_for_this, prefix_for_kids, parent_name=None):
+    left, right = fmt_row(name, prefix_for_this, is_orphan=False, parent_name=parent_name)
     items.append(("row", left, right))
     kids = children_of(name)
     for i, k in enumerate(kids):
         last = i == len(kids) - 1
         connector = "\u2514\u2500\u2500 " if last else "\u251c\u2500\u2500 "
         ext = "    " if last else "\u2502   "
-        render(k, prefix_for_kids + connector, prefix_for_kids + ext)
+        render(k, prefix_for_kids + connector, prefix_for_kids + ext, parent_name=name)
 
 linked_disp = c(BOLD, linked) if linked else c(DIM, "(none)")
 items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}"))
