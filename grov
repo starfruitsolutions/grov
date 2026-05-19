@@ -829,6 +829,32 @@ def children_of(name):
 
 items = []
 
+def get_remote_diff(wt):
+    try:
+        subprocess.check_output(
+            ["git", "-C", wt, "rev-parse", "@{u}"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+    except subprocess.CalledProcessError:
+        return c(DIM, "no remote")
+    try:
+        ahead = int(subprocess.check_output(
+            ["git", "-C", wt, "rev-list", "--count", "@{u}..HEAD"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip() or "0")
+        behind = int(subprocess.check_output(
+            ["git", "-C", wt, "rev-list", "--count", "HEAD..@{u}"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip() or "0")
+    except subprocess.CalledProcessError:
+        return ""
+    if not (ahead or behind):
+        return ""
+    parts = []
+    if ahead: parts.append(c(CYAN, f"\u21e1{ahead}"))
+    if behind: parts.append(c(CYAN, f"\u21e3{behind}"))
+    return " ".join(parts)
+
 def fmt_row(name, prefix, is_orphan, parent_name=None):
     if is_orphan:
         folder = name
@@ -853,6 +879,10 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
         except Exception:
             sc, st = ("unknown", "?")
         right = colorize_state(sc, st)
+        if parent_name is not None:
+            rdiff = get_remote_diff(folder_paths[folder])
+            if rdiff:
+                right = f"{right}  {rdiff}"
     return left, right
 
 INDENT = "  "
