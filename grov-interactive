@@ -10,6 +10,8 @@ import curses
 import json
 import locale
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,9 +21,20 @@ from typing import Optional
 
 BRANCHES = "branches"
 GROV_BIN = shutil.which("grov") or "grov"
+GROV_COMMANDS = {
+    "init", "restore", "checkout", "switch", "add", "status", "remove",
+    "restack", "push", "parent", "base", "stack", "interactive",
+    "root", "branch", "branches", "path", "scripts", "run",
+}
 
 
 # ---------- state ----------
+
+
+@dataclass
+class StatePart:
+    text: str
+    color: str = "plain"  # plain | dim | green | yellow | cyan | red
 
 
 @dataclass
@@ -29,11 +42,14 @@ class WorktreeInfo:
     folder: str = ""
     path: str = ""
     head: str = "?"
-    state_code: str = "unknown"
-    state_text: str = "?"
+    state_code: str = "unknown"  # clean|dirty|diverged|rebasing|noupstream|unknown
+    state_parts: list = field(default_factory=list)
     ahead: int = 0
     behind: int = 0
+    ins: int = 0
+    dels: int = 0
     upstream: str = ""
+    compare_to: str = ""  # parent branch (stack) or '@{u}' (trunk/orphan)
     rebasing: bool = False
 
 
@@ -66,14 +82,33 @@ def git_out(args, cwd) -> str:
         return ""
 
 
-def scan_worktree(folder: str, wt_path: str) -> WorktreeInfo:
+def git_ok(args, cwd) -> bool:
+    try:
+        return subprocess.run(
+            ["git", "-C", cwd] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def parse_shortstat(text: str) -> tuple:
+    ins = dels = 0
+    m = re.search(r"(\d+) insertion", text)
+    if m: ins = int(m.group(1))
+    m = re.search(r"(\d+) deletion", text)
+    if m: dels = int(m.group(1))
+    return ins, dels
+
+
+def scan_worktree(folder: str, wt_path: str, compare_to: Optional[str] = None) -> WorktreeInfo:
     info = WorktreeInfo(folder=folder, path=wt_path)
+    info.compare_to = compare_to or ""
     for sub in ("rebase-merge", "rebase-apply"):
         gp = git_out(["rev-parse", "--git-path", sub], wt_path)
         if gp and os.path.isdir(gp):
             info.rebasing = True
             info.state_code = "rebasing"
-            info.state_text = "rebase in progress"
+            info.state_parts = [StatePart("rebase in progress", "red")]
             break
     info.head = git_out(["rev-parse", "--abbrev-ref", "HEAD"], wt_path) or "?"
     info.upstream = git_out(["rev-parse", "--abbrev-ref", "@{u}"], wt_path)
@@ -82,26 +117,45 @@ def scan_worktree(folder: str, wt_path: str) -> WorktreeInfo:
     dirty = git_out(["status", "-s"], wt_path)
     if dirty:
         info.state_code = "dirty"
-        info.state_text = "uncommitted"
+        ss = git_out(["diff", "HEAD", "--shortstat"], wt_path)
+        info.ins, info.dels = parse_shortstat(ss)
+        parts = [StatePart("uncommitted", "yellow")]
+        if info.ins or info.dels:
+            parts.append(StatePart(f"+{info.ins}", "green"))
+            parts.append(StatePart(f"-{info.dels}", "red"))
+        info.state_parts = parts
         return info
-    if not info.upstream:
-        info.state_code = "noupstream"
-        info.state_text = "no upstream"
+    ref = compare_to if compare_to else "@{u}"
+    has_ref = git_ok(["rev-parse", "--verify", ref], wt_path)
+    if not has_ref:
+        if compare_to:
+            info.state_code = "unknown"
+            info.state_parts = [StatePart("?", "dim")]
+        else:
+            info.state_code = "noupstream"
+            info.state_parts = [StatePart("no upstream", "dim")]
         return info
     try:
-        info.ahead = int(git_out(["rev-list", "--count", "@{u}..HEAD"], wt_path) or "0")
-        info.behind = int(git_out(["rev-list", "--count", "HEAD..@{u}"], wt_path) or "0")
+        info.ahead = int(git_out(["rev-list", "--count", f"{ref}..HEAD"], wt_path) or "0")
+        info.behind = int(git_out(["rev-list", "--count", f"HEAD..{ref}"], wt_path) or "0")
     except ValueError:
         info.ahead = info.behind = 0
-    if info.ahead or info.behind:
-        info.state_code = "diverged"
-        parts = []
-        if info.ahead: parts.append(f"\u2191{info.ahead}")
-        if info.behind: parts.append(f"\u2193{info.behind}")
-        info.state_text = " ".join(parts)
-    else:
+    if not (info.ahead or info.behind):
         info.state_code = "clean"
-        info.state_text = "clean"
+        info.state_parts = [StatePart("clean", "green")]
+        return info
+    info.state_code = "diverged"
+    if compare_to and info.ahead:
+        ss = git_out(["diff", "--shortstat", f"{compare_to}...HEAD"], wt_path)
+        info.ins, info.dels = parse_shortstat(ss)
+    parts = [
+        StatePart(f"\u2191{info.ahead}", "cyan"),
+        StatePart(f"\u2193{info.behind}", "cyan"),
+    ]
+    if compare_to:
+        parts.append(StatePart(f"+{info.ins}", "green"))
+        parts.append(StatePart(f"-{info.dels}", "red"))
+    info.state_parts = parts
     return info
 
 
@@ -123,7 +177,17 @@ def load_state(root: str) -> State:
     linked = ""
     if os.path.islink(link):
         linked = os.path.basename(os.readlink(link).rstrip("/"))
-    worktrees: dict = {}
+
+    nodes: dict = {n: StackNode(name=n, parent=m.get("parent")) for n, m in raw.items()}
+    for n in nodes.values():
+        if n.parent and n.parent in nodes:
+            nodes[n.parent].children.append(n.name)
+    for n in nodes.values():
+        n.children.sort()
+    parent_of_branch = {b: nd.parent for b, nd in nodes.items()}
+
+    folder_paths: dict = {}
+    folder_head: dict = {}
     head_to_folder: dict = {}
     bdir = os.path.join(root, BRANCHES)
     if os.path.isdir(bdir):
@@ -131,16 +195,18 @@ def load_state(root: str) -> State:
             p = os.path.join(bdir, name)
             if not os.path.isdir(p): continue
             wt_path = os.path.realpath(p)
-            worktrees[name] = scan_worktree(name, wt_path)
-            h = worktrees[name].head
-            if h and h != "?":
+            folder_paths[name] = wt_path
+            h = git_out(["rev-parse", "--abbrev-ref", "HEAD"], wt_path) or "?"
+            folder_head[name] = h
+            if h != "?":
                 head_to_folder.setdefault(h, name)
-    nodes: dict = {n: StackNode(name=n, parent=m.get("parent")) for n, m in raw.items()}
-    for n in nodes.values():
-        if n.parent and n.parent in nodes:
-            nodes[n.parent].children.append(n.name)
-    for n in nodes.values():
-        n.children.sort()
+
+    worktrees: dict = {}
+    for fd, wt_path in folder_paths.items():
+        h = folder_head[fd]
+        cmp = parent_of_branch.get(h) or None
+        worktrees[fd] = scan_worktree(fd, wt_path, compare_to=cmp)
+
     stack_branches = set(nodes.keys())
     stack_roots = sorted([b for b, n in nodes.items() if (n.parent or "") not in stack_branches])
     trunks: list = []
@@ -167,21 +233,31 @@ def load_state(root: str) -> State:
 
 @dataclass
 class TreeRow:
-    kind: str
+    kind: str  # info | section | section_under | row | orphan | blank | dim
     name: str = ""
     prefix: str = ""
     folder: str = ""
     head: str = ""
+    value: str = ""
     is_linked: bool = False
     state_code: str = ""
-    state_text: str = ""
+    state_parts: list = field(default_factory=list)
     has_worktree: bool = False
 
 
+def _section(rows, title):
+    rows.append(TreeRow(kind="section", name=title))
+    rows.append(TreeRow(kind="section_under", name="\u2500" * len(title)))
+
+
 def build_rows(state: State) -> list:
-    rows: list = [TreeRow(kind="section", name="Stack")]
+    rows: list = []
+    rows.append(TreeRow(kind="info", name="Linked", value=state.linked or "(none)"))
+    rows.append(TreeRow(kind="info", name="Base", value=state.base or "(none)"))
+    rows.append(TreeRow(kind="blank"))
+    _section(rows, "Stack")
     if not state.nodes and not state.trunks:
-        rows.append(TreeRow(kind="dim", name="(empty)"))
+        rows.append(TreeRow(kind="dim", name="  (empty)"))
 
     def find_folder(branch):
         return state.head_to_folder.get(branch)
@@ -199,7 +275,7 @@ def build_rows(state: State) -> list:
             folder=folder or "", head=(wt.head if wt else ""),
             is_linked=(folder is not None and folder == state.linked),
             state_code=(wt.state_code if wt else ""),
-            state_text=(wt.state_text if wt else ""),
+            state_parts=(list(wt.state_parts) if wt else []),
             has_worktree=(wt is not None),
         ))
         kids = children_of(name)
@@ -216,13 +292,14 @@ def build_rows(state: State) -> list:
             render(r, "  ", "  ")
     if state.orphans:
         rows.append(TreeRow(kind="blank"))
-        rows.append(TreeRow(kind="section", name="Orphans"))
+        _section(rows, "Orphans")
         for fd in state.orphans:
             wt = state.worktrees[fd]
             rows.append(TreeRow(
                 kind="orphan", name=fd, prefix="  ",
                 folder=fd, head=wt.head, is_linked=(fd == state.linked),
-                state_code=wt.state_code, state_text=wt.state_text, has_worktree=True,
+                state_code=wt.state_code, state_parts=list(wt.state_parts),
+                has_worktree=True,
             ))
     return rows
 
@@ -231,18 +308,18 @@ def build_rows(state: State) -> list:
 
 
 KEYBAR = [
-    "[Enter/c]switch  [n]new  [C]checkout  [p]reparent  [P]push  [r]restack",
-    "[d]remove  [b]base  [f]fetch  [s]diff  [/]filter  [F5]refresh  [?]help  [q]quit",
+    "[Enter/c]switch  [n]new  [C]checkout  [p]reparent  [P]push  [r]restack  [d]remove",
+    "[:]cmd  [b]base  [f]fetch  [s]diff  [/]filter  [F5]refresh  [?]help  [q]quit",
 ]
 
 
-COLOR = {"clean": 1, "dirty": 2, "diverged": 3, "rebasing": 4}
+COLOR = {"green": 1, "yellow": 2, "cyan": 3, "red": 4}
 
 
-def color_for(code: str) -> int:
+def color_for(name: str) -> int:
     if not curses.has_colors(): return 0
-    if code == "noupstream": return curses.A_DIM
-    n = COLOR.get(code)
+    if name == "dim": return curses.A_DIM
+    n = COLOR.get(name)
     return curses.color_pair(n) if n else 0
 
 
@@ -260,6 +337,9 @@ class App:
         self.show_diff = False
         self.cmd_log: collections.deque = collections.deque(maxlen=200)
         self.last_action = ""
+        self.cmd_output: Optional[list] = None
+        self.cmd_output_title = ""
+        self.cmd_output_scroll = 0
 
     # ---- state ----
     def refresh_state(self):
@@ -272,7 +352,7 @@ class App:
             f = self.filter.lower()
             visible = []
             for r in all_rows:
-                if r.kind in ("section", "blank", "dim"):
+                if r.kind in ("info", "section", "section_under", "blank", "dim"):
                     visible.append(r)
                 elif f in r.name.lower():
                     visible.append(r)
@@ -353,42 +433,84 @@ class App:
             self.draw_row(top + i, x, w, self.rows[ri], ri == sel_idx)
 
     def draw_row(self, y, x, w, row, selected):
+        if row.kind == "info":
+            label = (row.name + ":").ljust(8)
+            self.addstr(y, x, label, curses.A_DIM, w)
+            vx = x + len(label)
+            self.addstr(y, vx, row.value, curses.A_BOLD, max(0, w - len(label)))
+            return
         if row.kind == "section":
             self.addstr(y, x, row.name, curses.A_BOLD, w); return
+        if row.kind == "section_under":
+            self.addstr(y, x, row.name, curses.A_DIM, w); return
         if row.kind == "blank":
             return
         if row.kind == "dim":
             self.addstr(y, x, row.name, curses.A_DIM, w); return
-        marker = " \u25cf" if row.is_linked else ""
         suffix = ""
         if row.folder and row.folder != row.name and row.kind == "row":
             suffix = f"  [wt:{row.folder}]"
         elif row.kind == "orphan" and row.head and row.head != row.name:
             suffix = f"  [head:{row.head}]"
-        left = f"{row.prefix}{row.name}{marker}{suffix}"
-        right = row.state_text if row.has_worktree else "(no worktree)"
-        avail = max(0, w - 1)
-        right_w = min(len(right), max(0, avail // 2))
-        left_w = max(0, avail - right_w - 1)
-        left_disp = left[:left_w].ljust(left_w)
-        right_disp = right[:right_w].rjust(right_w)
+        rest = f"{row.prefix}{row.name}{suffix}"
+        parts = row.state_parts if row.has_worktree else [StatePart("(no worktree)", "dim")]
+        right_text = " ".join(p.text for p in parts)
+        avail = max(0, w - 2)  # 1 col for mark, 1 col for spacer before right
+        right_w = min(len(right_text), max(0, avail // 2))
+        rest_w = max(0, avail - right_w)
         base = curses.A_REVERSE if selected else 0
-        link_attr = curses.A_BOLD if row.is_linked else 0
-        col = color_for(row.state_code) if row.has_worktree else curses.A_DIM
+        mark = "\u25cf" if row.is_linked else " "
+        mark_attr = base | (color_for("green") if row.is_linked else 0)
+        rest_attr = base | (curses.A_BOLD if row.is_linked else 0)
+        rest_disp = rest[:rest_w].ljust(rest_w)
         try:
-            self.scr.addnstr(y, x, left_disp, left_w, base | link_attr)
-            self.scr.addnstr(y, x + left_w, " ", 1, base)
-            self.scr.addnstr(y, x + left_w + 1, right_disp, right_w, base | col)
+            self.scr.addnstr(y, x, mark, 1, mark_attr)
+            self.scr.addnstr(y, x + 1, rest_disp, rest_w, rest_attr)
+            self.scr.addnstr(y, x + 1 + rest_w, " ", 1, base)
         except curses.error:
             pass
+        rx = x + 1 + rest_w + 1 + max(0, right_w - len(right_text))
+        remaining = right_w
+        for i, p in enumerate(parts):
+            if remaining <= 0: break
+            if i > 0:
+                try: self.scr.addnstr(y, rx, " ", 1, base)
+                except curses.error: pass
+                rx += 1; remaining -= 1
+                if remaining <= 0: break
+            t = p.text[:remaining]
+            attr = base | color_for(p.color)
+            try: self.scr.addnstr(y, rx, t, len(t), attr)
+            except curses.error: pass
+            rx += len(t); remaining -= len(t)
 
     def draw_detail(self, top, x, h, w):
+        if self.cmd_output is not None:
+            self.draw_output(top, x, h, w); return
         row = self.current()
         if not row:
             self.addstr(top, x, "(no selection)", curses.A_DIM, w); return
         items = self.detail_items(row)
         for i, it in enumerate(items[:h]):
             self.draw_detail_item(top + i, x, w, it)
+
+    def draw_output(self, top, x, h, w):
+        total = len(self.cmd_output)
+        body_h = max(0, h - 2)
+        max_scroll = max(0, total - body_h)
+        if self.cmd_output_scroll > max_scroll: self.cmd_output_scroll = max_scroll
+        if self.cmd_output_scroll < 0: self.cmd_output_scroll = 0
+        title = self.cmd_output_title or "(no output)"
+        hint = f"  [{self.cmd_output_scroll + 1}-{min(total, self.cmd_output_scroll + body_h)}/{total}]" if total > body_h else ""
+        head = (title + hint).ljust(w)
+        self.addstr(top, x, head[:w], curses.A_REVERSE, w)
+        self.addstr(top + 1, x,
+                    " PgDn/PgUp Ctrl-D/U scroll \u00b7 Esc close ".ljust(w)[:w],
+                    curses.A_DIM, w)
+        for i in range(body_h):
+            idx = self.cmd_output_scroll + i
+            if idx >= total: break
+            self.addstr(top + 2 + i, x, self.cmd_output[idx][:w], 0, w)
 
     def draw_detail_item(self, y, x, w, item):
         kind = item[0]
@@ -423,35 +545,41 @@ class App:
                 out.append(("kv", "children", ", ".join(nd.children)))
         elif row.name in self.state.trunks:
             out.append(("dim", "  (trunk)"))
-        if wt:
-            out.append(("kv", "state", wt.state_text))
-            out.append(("kv", "upstream", wt.upstream or "(none)"))
-            if wt.upstream:
-                log = git_out(["log", "--oneline", "-n", "10", "@{u}..HEAD"], wt.path)
-                if log:
-                    out.append(("blank",))
-                    out.append(("hdr", "Unpushed commits"))
-                    for line in log.splitlines():
-                        out.append(("plain", "  " + line))
-                blog = git_out(["log", "--oneline", "-n", "5", "HEAD..@{u}"], wt.path)
-                if blog:
-                    out.append(("blank",))
-                    out.append(("hdr", "Behind (remote ahead)"))
-                    for line in blog.splitlines():
-                        out.append(("plain", "  " + line))
-            status = git_out(["status", "--short"], wt.path)
-            if status:
+        if not wt:
+            return out
+        state_text = " ".join(p.text for p in wt.state_parts) or "?"
+        out.append(("kv", "state", state_text))
+        out.append(("kv", "upstream", wt.upstream or "(none)"))
+        cmp_ref = wt.compare_to or ("@{u}" if wt.upstream else "")
+        if cmp_ref:
+            out.append(("kv", "compared to", cmp_ref))
+            log = git_out(["log", "--oneline", "-n", "10", f"{cmp_ref}..HEAD"], wt.path)
+            if log:
                 out.append(("blank",))
-                out.append(("hdr", "Working tree"))
-                for line in status.splitlines()[:15]:
+                hdr = f"Commits ahead of {cmp_ref}"
+                out.append(("hdr", hdr))
+                for line in log.splitlines():
                     out.append(("plain", "  " + line))
-            if self.show_diff and wt.upstream:
-                stat = git_out(["diff", "--stat", "@{u}..HEAD"], wt.path)
-                if stat:
-                    out.append(("blank",))
-                    out.append(("hdr", "Diff vs upstream"))
-                    for line in stat.splitlines():
-                        out.append(("plain", "  " + line))
+            blog = git_out(["log", "--oneline", "-n", "5", f"HEAD..{cmp_ref}"], wt.path)
+            if blog:
+                out.append(("blank",))
+                out.append(("hdr", f"Behind {cmp_ref}"))
+                for line in blog.splitlines():
+                    out.append(("plain", "  " + line))
+        status = git_out(["status", "--short"], wt.path)
+        if status:
+            out.append(("blank",))
+            out.append(("hdr", "Working tree"))
+            for line in status.splitlines()[:15]:
+                out.append(("plain", "  " + line))
+        if self.show_diff and cmp_ref:
+            triple = f"{wt.compare_to}...HEAD" if wt.compare_to else f"{cmp_ref}..HEAD"
+            stat = git_out(["diff", "--stat", triple], wt.path)
+            if stat:
+                out.append(("blank",))
+                out.append(("hdr", f"Diff stat ({triple})"))
+                for line in stat.splitlines():
+                    out.append(("plain", "  " + line))
         return out
 
     # ---- prompts ----
@@ -543,6 +671,63 @@ class App:
         if confirm and not self.confirm(confirm): return
         self.exec_argv([GROV_BIN] + args)
 
+    def _cmd_cwd(self) -> str:
+        r = self.current()
+        if r and r.folder:
+            wt = self.state.worktrees.get(r.folder)
+            if wt and wt.path and os.path.isdir(wt.path):
+                return wt.path
+        if self.state.linked:
+            link = os.path.join(self.root, "workspace")
+            try:
+                p = os.path.realpath(link)
+                if os.path.isdir(p): return p
+            except OSError:
+                pass
+        return self.root
+
+    def run_shell_capture(self, cmd_str: str, title: str):
+        env = dict(os.environ); env["NO_COLOR"] = "1"
+        cwd = self._cmd_cwd()
+        rc = 127
+        lines: list = []
+        try:
+            res = subprocess.run(
+                cmd_str, cwd=cwd, env=env, shell=True,
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            )
+            rc = res.returncode
+            if res.stdout: lines.extend(res.stdout.splitlines())
+            if res.stderr:
+                if lines: lines.append("")
+                lines.append("--- stderr ---")
+                lines.extend(res.stderr.splitlines())
+        except Exception as e:
+            lines.append(f"error: {e}")
+        if not lines: lines = ["(no output)"]
+        lines.append("")
+        lines.append(f"[exit {rc}]  cwd: {cwd}")
+        self.cmd_output = lines
+        self.cmd_output_title = title
+        self.cmd_output_scroll = 0
+        self.last_action = title
+        self.cmd_log.append(f"$ {title}  \u2192 exit {rc}")
+        self.refresh_state()
+
+    def act_cmd_prompt(self):
+        raw = self.prompt("$")
+        if not raw: return
+        raw = raw.strip()
+        if not raw: return
+        first = raw.split(maxsplit=1)[0]
+        if first in GROV_COMMANDS:
+            cmd_str = f"{shlex.quote(GROV_BIN)} {raw}"
+            title = f"grov {raw}"
+        else:
+            cmd_str = raw
+            title = raw
+        self.run_shell_capture(cmd_str, title)
+
     def act_switch(self):
         r = self.current()
         if not r or not r.folder: return
@@ -621,11 +806,11 @@ class App:
             "  k / up         move up",
             "  g / G          top / bottom",
             "  /              filter (Enter applies, Esc clears)",
-            "  F5 / Ctrl-R    refresh",
+            "  F5 / Ctrl-R    refresh state",
             "  ?              this help",
             "  q              quit",
             "",
-            "Actions  (run grov underneath; output shown after)",
+            "Actions  (suspend curses, run grov, press Enter to return)",
             "  Enter / c      switch workspace symlink to selected",
             "  C              checkout existing branch by name (prompt)",
             "  n              new branch off linked (grov checkout -b)",
@@ -636,6 +821,17 @@ class App:
             "  b              set selected as base",
             "  f              git fetch --all",
             "  s              toggle diff-stat in detail pane",
+            "",
+            "Command prompt (captured output shown in right pane)",
+            "  :              type a command; runs in selected worktree's cwd",
+            "                 known grov subcommands auto-prefixed with `grov`,",
+            "                 anything else runs through the shell ($SHELL)",
+            "                   :status        \u2192 grov status",
+            "                   :git status    \u2192 git status",
+            "                   :ls -la        \u2192 ls -la",
+            "  PgDn / Ctrl-D  scroll output down",
+            "  PgUp / Ctrl-U  scroll output up",
+            "  Esc            close output, back to detail view",
             "",
             "Press any key to close.",
         ]
@@ -671,13 +867,25 @@ class App:
                     self.filter += chr(ch)
                     self.rebuild_rows()
                 continue
-            if ch in (ord("q"),): break
+            if ch == 27 and self.cmd_output is not None:
+                self.cmd_output = None
+                continue
+            if ch in (curses.KEY_NPAGE, 4):  # PgDn / Ctrl-D
+                if self.cmd_output is not None:
+                    self.cmd_output_scroll += max(1, self.scr.getmaxyx()[0] // 3)
+                    continue
+            if ch in (curses.KEY_PPAGE, 21):  # PgUp / Ctrl-U
+                if self.cmd_output is not None:
+                    self.cmd_output_scroll -= max(1, self.scr.getmaxyx()[0] // 3)
+                    continue
+            if ch == ord("q"): break
             elif ch in (curses.KEY_DOWN, ord("j")):
                 if self.selectable: self.cursor = min(self.cursor + 1, len(self.selectable) - 1)
             elif ch in (curses.KEY_UP, ord("k")):
                 if self.selectable: self.cursor = max(self.cursor - 1, 0)
             elif ch == ord("g"): self.cursor = 0
             elif ch == ord("G"): self.cursor = max(0, len(self.selectable) - 1)
+            elif ch == ord(":"): self.act_cmd_prompt()
             elif ch == ord("/"):
                 self.filter_active = True
                 self.filter = ""
@@ -703,10 +911,10 @@ def init_colors():
     try: curses.use_default_colors()
     except curses.error: pass
     bg = -1
-    curses.init_pair(COLOR["clean"], curses.COLOR_GREEN, bg)
-    curses.init_pair(COLOR["dirty"], curses.COLOR_YELLOW, bg)
-    curses.init_pair(COLOR["diverged"], curses.COLOR_CYAN, bg)
-    curses.init_pair(COLOR["rebasing"], curses.COLOR_RED, bg)
+    curses.init_pair(COLOR["green"], curses.COLOR_GREEN, bg)
+    curses.init_pair(COLOR["yellow"], curses.COLOR_YELLOW, bg)
+    curses.init_pair(COLOR["cyan"], curses.COLOR_CYAN, bg)
+    curses.init_pair(COLOR["red"], curses.COLOR_RED, bg)
 
 
 def run(stdscr, root):
