@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${1:-$HOME/.local/bin}"
 
 mkdir -p "$BIN_DIR"
-if [[ -f "$BIN_DIR/grov" || -f "$BIN_DIR/grov-completion.bash" ]]; then
+if [[ -f "$BIN_DIR/grov" || -f "$BIN_DIR/grov-completion.bash" || -f "$BIN_DIR/grov-interactive" ]]; then
   echo -n "grov already installed at $BIN_DIR. Overwrite? [y/N] "
   read -r ans
   if [[ "$ans" != [yY]* ]]; then
@@ -17,6 +17,10 @@ if [[ -f "$BIN_DIR/grov" || -f "$BIN_DIR/grov-completion.bash" ]]; then
 fi
 cp "$SCRIPT_DIR/grov" "$BIN_DIR/grov"
 chmod +x "$BIN_DIR/grov"
+if [[ -f "$SCRIPT_DIR/grov-interactive" ]]; then
+  cp "$SCRIPT_DIR/grov-interactive" "$BIN_DIR/grov-interactive"
+  chmod +x "$BIN_DIR/grov-interactive"
+fi
 if [[ -f "$SCRIPT_DIR/grov-completion.bash" ]]; then
   cp "$SCRIPT_DIR/grov-completion.bash" "$BIN_DIR/grov-completion.bash"
 fi

@@ -27,6 +27,7 @@
 #   work [<target>]         subshell in a worktree (default: workspace mount; no mount change)
 #   merge [<branch-a>] [<branch-b>]   merge branch-a into branch-b (default target: workspace)
 #   exec <branch> -- <cmd...>   run a command in a branch worktree (no link change)
+#   interactive              launch curses TUI dashboard
 #   scripts                 list custom scripts in .grov/scripts
 #   run <name> [args...]    run .grov/scripts/<name>
 
@@ -576,6 +577,7 @@ usage() {
   echo "  work [<target>]          subshell in worktree (default: workspace; mounts unchanged)"
   echo "  merge [<branch-a>] [<branch-b>]   merge branch-a into branch-b (default target: workspace)"
   echo "  exec <branch> -- <cmd...>   run command in worktree (no link change)"
+  echo "  interactive              launch curses TUI dashboard"
   echo "  root | branch | branches | path | scripts"
   echo "  run <name> [args...]     run .grov/scripts/<name>"
   exit 1
@@ -2569,6 +2571,19 @@ case "$cmd" in
   restore)    cmd_restore "$GROV_ROOT" ;;
   scripts)    cmd_scripts "$GROV_ROOT" ;;
   run)        cmd_run "$GROV_ROOT" "$@" ;;
+  interactive)
+    bin="grov-interactive"
+    here=$(dirname "$(readlink -f "$0")")
+    export GROV_ROOT
+    if [[ -x "$here/$bin" ]]; then
+      exec "$here/$bin" "$GROV_ROOT" "$@"
+    elif command -v "$bin" &>/dev/null; then
+      exec "$bin" "$GROV_ROOT" "$@"
+    else
+      echo "Error: $bin not found next to grov or on PATH." >&2
+      exit 1
+    fi
+    ;;
   "")
     usage
     ;;

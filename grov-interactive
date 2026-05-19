@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""grov interactive: curses TUI dashboard for grov.
+
+Reads grov state directly (.grov/stack.json, branches/*, workspace symlink)
+and shells out to `grov` for every mutation so behavior stays consistent.
+"""
+import argparse
+import collections
+import curses
+import json
+import locale
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+BRANCHES = "branches"
+GROV_BIN = shutil.which("grov") or "grov"
+
+
+# ---------- state ----------
+
+
+@dataclass
+class WorktreeInfo:
+    folder: str = ""
+    path: str = ""
+    head: str = "?"
+    state_code: str = "unknown"
+    state_text: str = "?"
+    ahead: int = 0
+    behind: int = 0
+    upstream: str = ""
+    rebasing: bool = False
+
+
+@dataclass
+class StackNode:
+    name: str
+    parent: Optional[str]
+    children: list = field(default_factory=list)
+
+
+@dataclass
+class State:
+    root: str
+    base: str
+    linked: str
+    nodes: dict
+    worktrees: dict
+    head_to_folder: dict
+    trunks: list
+    stack_roots: list
+    orphans: list
+
+
+def git_out(args, cwd) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", cwd] + args, stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def scan_worktree(folder: str, wt_path: str) -> WorktreeInfo:
+    info = WorktreeInfo(folder=folder, path=wt_path)
+    for sub in ("rebase-merge", "rebase-apply"):
+        gp = git_out(["rev-parse", "--git-path", sub], wt_path)
+        if gp and os.path.isdir(gp):
+            info.rebasing = True
+            info.state_code = "rebasing"
+            info.state_text = "rebase in progress"
+            break
+    info.head = git_out(["rev-parse", "--abbrev-ref", "HEAD"], wt_path) or "?"
+    info.upstream = git_out(["rev-parse", "--abbrev-ref", "@{u}"], wt_path)
+    if info.rebasing:
+        return info
+    dirty = git_out(["status", "-s"], wt_path)
+    if dirty:
+        info.state_code = "dirty"
+        info.state_text = "uncommitted"
+        return info
+    if not info.upstream:
+        info.state_code = "noupstream"
+        info.state_text = "no upstream"
+        return info
+    try:
+        info.ahead = int(git_out(["rev-list", "--count", "@{u}..HEAD"], wt_path) or "0")
+        info.behind = int(git_out(["rev-list", "--count", "HEAD..@{u}"], wt_path) or "0")
+    except ValueError:
+        info.ahead = info.behind = 0
+    if info.ahead or info.behind:
+        info.state_code = "diverged"
+        parts = []
+        if info.ahead: parts.append(f"\u2191{info.ahead}")
+        if info.behind: parts.append(f"\u2193{info.behind}")
+        info.state_text = " ".join(parts)
+    else:
+        info.state_code = "clean"
+        info.state_text = "clean"
+    return info
+
+
+def load_state(root: str) -> State:
+    try:
+        with open(os.path.join(root, ".grov", "stack.json")) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {"version": 1, "nodes": {}}
+    raw = data.get("nodes") or {}
+    base = data.get("base") or ""
+    if not base:
+        try:
+            with open(os.path.join(root, ".grov", "primary-branch")) as f:
+                base = f.read().strip()
+        except FileNotFoundError:
+            base = ""
+    link = os.path.join(root, "workspace")
+    linked = ""
+    if os.path.islink(link):
+        linked = os.path.basename(os.readlink(link).rstrip("/"))
+    worktrees: dict = {}
+    head_to_folder: dict = {}
+    bdir = os.path.join(root, BRANCHES)
+    if os.path.isdir(bdir):
+        for name in sorted(os.listdir(bdir)):
+            p = os.path.join(bdir, name)
+            if not os.path.isdir(p): continue
+            wt_path = os.path.realpath(p)
+            worktrees[name] = scan_worktree(name, wt_path)
+            h = worktrees[name].head
+            if h and h != "?":
+                head_to_folder.setdefault(h, name)
+    nodes: dict = {n: StackNode(name=n, parent=m.get("parent")) for n, m in raw.items()}
+    for n in nodes.values():
+        if n.parent and n.parent in nodes:
+            nodes[n.parent].children.append(n.name)
+    for n in nodes.values():
+        n.children.sort()
+    stack_branches = set(nodes.keys())
+    stack_roots = sorted([b for b, n in nodes.items() if (n.parent or "") not in stack_branches])
+    trunks: list = []
+    seen_trunks: set = set()
+    for rt in stack_roots:
+        par = nodes[rt].parent or ""
+        if par and par not in seen_trunks:
+            trunks.append(par)
+            seen_trunks.add(par)
+    displayed = stack_branches | set(trunks)
+    orphans = sorted([
+        fd for fd, wt in worktrees.items()
+        if wt.head not in displayed and fd not in displayed
+    ])
+    return State(
+        root=root, base=base, linked=linked, nodes=nodes,
+        worktrees=worktrees, head_to_folder=head_to_folder,
+        trunks=trunks, stack_roots=stack_roots, orphans=orphans,
+    )
+
+
+# ---------- rendering rows ----------
+
+
+@dataclass
+class TreeRow:
+    kind: str
+    name: str = ""
+    prefix: str = ""
+    folder: str = ""
+    head: str = ""
+    is_linked: bool = False
+    state_code: str = ""
+    state_text: str = ""
+    has_worktree: bool = False
+
+
+def build_rows(state: State) -> list:
+    rows: list = [TreeRow(kind="section", name="Stack")]
+    if not state.nodes and not state.trunks:
+        rows.append(TreeRow(kind="dim", name="(empty)"))
+
+    def find_folder(branch):
+        return state.head_to_folder.get(branch)
+
+    def children_of(name):
+        if name in state.nodes:
+            return list(state.nodes[name].children)
+        return sorted([r for r in state.stack_roots if (state.nodes[r].parent or "") == name])
+
+    def render(name, prefix_this, prefix_kids):
+        folder = find_folder(name)
+        wt = state.worktrees.get(folder) if folder else None
+        rows.append(TreeRow(
+            kind="row", name=name, prefix=prefix_this,
+            folder=folder or "", head=(wt.head if wt else ""),
+            is_linked=(folder is not None and folder == state.linked),
+            state_code=(wt.state_code if wt else ""),
+            state_text=(wt.state_text if wt else ""),
+            has_worktree=(wt is not None),
+        ))
+        kids = children_of(name)
+        for i, k in enumerate(kids):
+            last = i == len(kids) - 1
+            connector = "\u2514\u2500 " if last else "\u251c\u2500 "
+            ext = "   " if last else "\u2502  "
+            render(k, prefix_kids + connector, prefix_kids + ext)
+
+    for t in state.trunks:
+        render(t, "  ", "  ")
+    for r in state.stack_roots:
+        if not state.nodes[r].parent:
+            render(r, "  ", "  ")
+    if state.orphans:
+        rows.append(TreeRow(kind="blank"))
+        rows.append(TreeRow(kind="section", name="Orphans"))
+        for fd in state.orphans:
+            wt = state.worktrees[fd]
+            rows.append(TreeRow(
+                kind="orphan", name=fd, prefix="  ",
+                folder=fd, head=wt.head, is_linked=(fd == state.linked),
+                state_code=wt.state_code, state_text=wt.state_text, has_worktree=True,
+            ))
+    return rows
+
+
+# ---------- ui ----------
+
+
+KEYBAR = [
+    "[Enter/c]switch  [n]new  [C]checkout  [p]reparent  [P]push  [r]restack",
+    "[d]remove  [b]base  [f]fetch  [s]diff  [/]filter  [F5]refresh  [?]help  [q]quit",
+]
+
+
+COLOR = {"clean": 1, "dirty": 2, "diverged": 3, "rebasing": 4}
+
+
+def color_for(code: str) -> int:
+    if not curses.has_colors(): return 0
+    if code == "noupstream": return curses.A_DIM
+    n = COLOR.get(code)
+    return curses.color_pair(n) if n else 0
+
+
+class App:
+    def __init__(self, stdscr, root):
+        self.scr = stdscr
+        self.root = root
+        self.state: Optional[State] = None
+        self.rows: list = []
+        self.selectable: list = []
+        self.cursor = 0
+        self.view_top = 0
+        self.filter = ""
+        self.filter_active = False
+        self.show_diff = False
+        self.cmd_log: collections.deque = collections.deque(maxlen=200)
+        self.last_action = ""
+
+    # ---- state ----
+    def refresh_state(self):
+        self.state = load_state(self.root)
+        self.rebuild_rows()
+
+    def rebuild_rows(self):
+        all_rows = build_rows(self.state)
+        if self.filter:
+            f = self.filter.lower()
+            visible = []
+            for r in all_rows:
+                if r.kind in ("section", "blank", "dim"):
+                    visible.append(r)
+                elif f in r.name.lower():
+                    visible.append(r)
+            self.rows = visible
+        else:
+            self.rows = all_rows
+        self.selectable = [i for i, r in enumerate(self.rows) if r.kind in ("row", "orphan")]
+        if not self.selectable:
+            self.cursor = 0
+        elif self.cursor >= len(self.selectable):
+            self.cursor = len(self.selectable) - 1
+
+    def current(self) -> Optional[TreeRow]:
+        if not self.selectable: return None
+        return self.rows[self.selectable[self.cursor]]
+
+    # ---- drawing ----
+    def addstr(self, y, x, s, attr=0, maxw=None):
+        if maxw is None: maxw = len(s)
+        try:
+            self.scr.addnstr(y, x, s, max(0, maxw), attr)
+        except curses.error:
+            pass
+
+    def draw(self):
+        h, w = self.scr.getmaxyx()
+        self.scr.erase()
+        rebasing = [wt.folder for wt in self.state.worktrees.values() if wt.rebasing]
+        warn = f"  REBASE: {', '.join(rebasing)}" if rebasing else ""
+        hdr = (
+            f" grov  root: {self.root}   base: {self.state.base or '?'}"
+            f"   linked: {self.state.linked or '(none)'}{warn} "
+        )
+        self.addstr(0, 0, hdr.ljust(w), curses.A_REVERSE, w)
+
+        kb_lines = len(KEYBAR)
+        cmd_lines = max(3, min(8, h // 6))
+        keybar_top = h - cmd_lines - kb_lines
+        cmd_top = h - cmd_lines
+        body_top = 1
+        body_h = max(1, keybar_top - body_top)
+        left_w = max(28, w // 2)
+        right_x = left_w + 1
+        right_w = max(0, w - right_x)
+
+        self.draw_tree(body_top, 0, body_h, left_w)
+        for y in range(body_top, body_top + body_h):
+            try: self.scr.addch(y, left_w, curses.ACS_VLINE)
+            except curses.error: pass
+        self.draw_detail(body_top, right_x, body_h, right_w)
+
+        for i, line in enumerate(KEYBAR):
+            self.addstr(keybar_top + i, 0, line.ljust(w), 0, w)
+
+        title = " command:"
+        if self.last_action: title += " " + self.last_action
+        self.addstr(cmd_top, 0, title.ljust(w), curses.A_BOLD, w)
+        log = list(self.cmd_log)[-(cmd_lines - 1):]
+        for i, line in enumerate(log):
+            self.addstr(cmd_top + 1 + i, 0, line.ljust(w), 0, w)
+
+        if self.filter_active:
+            self.addstr(h - 1, 0, f" filter: {self.filter}_".ljust(w), curses.A_REVERSE, w)
+
+        self.scr.refresh()
+
+    def draw_tree(self, top, x, h, w):
+        if not self.rows:
+            self.addstr(top, x, "(no branches)", curses.A_DIM, w)
+            return
+        sel_idx = self.selectable[self.cursor] if self.selectable else 0
+        if sel_idx < self.view_top: self.view_top = sel_idx
+        if sel_idx >= self.view_top + h: self.view_top = sel_idx - h + 1
+        self.view_top = max(0, min(self.view_top, max(0, len(self.rows) - h)))
+        for i in range(h):
+            ri = self.view_top + i
+            if ri >= len(self.rows): break
+            self.draw_row(top + i, x, w, self.rows[ri], ri == sel_idx)
+
+    def draw_row(self, y, x, w, row, selected):
+        if row.kind == "section":
+            self.addstr(y, x, row.name, curses.A_BOLD, w); return
+        if row.kind == "blank":
+            return
+        if row.kind == "dim":
+            self.addstr(y, x, row.name, curses.A_DIM, w); return
+        marker = " \u25cf" if row.is_linked else ""
+        suffix = ""
+        if row.folder and row.folder != row.name and row.kind == "row":
+            suffix = f"  [wt:{row.folder}]"
+        elif row.kind == "orphan" and row.head and row.head != row.name:
+            suffix = f"  [head:{row.head}]"
+        left = f"{row.prefix}{row.name}{marker}{suffix}"
+        right = row.state_text if row.has_worktree else "(no worktree)"
+        avail = max(0, w - 1)
+        right_w = min(len(right), max(0, avail // 2))
+        left_w = max(0, avail - right_w - 1)
+        left_disp = left[:left_w].ljust(left_w)
+        right_disp = right[:right_w].rjust(right_w)
+        base = curses.A_REVERSE if selected else 0
+        link_attr = curses.A_BOLD if row.is_linked else 0
+        col = color_for(row.state_code) if row.has_worktree else curses.A_DIM
+        try:
+            self.scr.addnstr(y, x, left_disp, left_w, base | link_attr)
+            self.scr.addnstr(y, x + left_w, " ", 1, base)
+            self.scr.addnstr(y, x + left_w + 1, right_disp, right_w, base | col)
+        except curses.error:
+            pass
+
+    def draw_detail(self, top, x, h, w):
+        row = self.current()
+        if not row:
+            self.addstr(top, x, "(no selection)", curses.A_DIM, w); return
+        items = self.detail_items(row)
+        for i, it in enumerate(items[:h]):
+            self.draw_detail_item(top + i, x, w, it)
+
+    def draw_detail_item(self, y, x, w, item):
+        kind = item[0]
+        if kind == "title":
+            self.addstr(y, x, item[1], curses.A_BOLD, w)
+        elif kind == "kv":
+            label = f"  {item[1]}: "
+            self.addstr(y, x, label, curses.A_DIM, w)
+            self.addstr(y, x + len(label), item[2], 0, max(0, w - len(label)))
+        elif kind == "hdr":
+            self.addstr(y, x, item[1], curses.A_BOLD, w)
+        elif kind == "dim":
+            self.addstr(y, x, item[1], curses.A_DIM, w)
+        elif kind == "blank":
+            return
+        else:
+            self.addstr(y, x, item[1], 0, w)
+
+    def detail_items(self, row: TreeRow) -> list:
+        out: list = [("title", row.name)]
+        wt = self.state.worktrees.get(row.folder) if row.folder else None
+        if wt:
+            out.append(("kv", "worktree", f"branches/{wt.folder}"))
+            if wt.head and wt.head != row.name:
+                out.append(("kv", "head", wt.head))
+        else:
+            out.append(("dim", "  (no worktree)"))
+        nd = self.state.nodes.get(row.name)
+        if nd:
+            out.append(("kv", "parent", nd.parent or "(none)"))
+            if nd.children:
+                out.append(("kv", "children", ", ".join(nd.children)))
+        elif row.name in self.state.trunks:
+            out.append(("dim", "  (trunk)"))
+        if wt:
+            out.append(("kv", "state", wt.state_text))
+            out.append(("kv", "upstream", wt.upstream or "(none)"))
+            if wt.upstream:
+                log = git_out(["log", "--oneline", "-n", "10", "@{u}..HEAD"], wt.path)
+                if log:
+                    out.append(("blank",))
+                    out.append(("hdr", "Unpushed commits"))
+                    for line in log.splitlines():
+                        out.append(("plain", "  " + line))
+                blog = git_out(["log", "--oneline", "-n", "5", "HEAD..@{u}"], wt.path)
+                if blog:
+                    out.append(("blank",))
+                    out.append(("hdr", "Behind (remote ahead)"))
+                    for line in blog.splitlines():
+                        out.append(("plain", "  " + line))
+            status = git_out(["status", "--short"], wt.path)
+            if status:
+                out.append(("blank",))
+                out.append(("hdr", "Working tree"))
+                for line in status.splitlines()[:15]:
+                    out.append(("plain", "  " + line))
+            if self.show_diff and wt.upstream:
+                stat = git_out(["diff", "--stat", "@{u}..HEAD"], wt.path)
+                if stat:
+                    out.append(("blank",))
+                    out.append(("hdr", "Diff vs upstream"))
+                    for line in stat.splitlines():
+                        out.append(("plain", "  " + line))
+        return out
+
+    # ---- prompts ----
+    def confirm(self, prompt: str) -> bool:
+        h, w = self.scr.getmaxyx()
+        text = f" {prompt} [y/N] "
+        y = max(0, h // 2)
+        x = max(0, (w - len(text)) // 2)
+        try: self.scr.addnstr(y, x, text, len(text), curses.A_REVERSE)
+        except curses.error: pass
+        self.scr.refresh()
+        ch = self.scr.getch()
+        return 0 <= ch < 256 and chr(ch).lower() == "y"
+
+    def prompt(self, label: str) -> Optional[str]:
+        curses.curs_set(1)
+        try:
+            h, w = self.scr.getmaxyx()
+            buf = ""
+            while True:
+                line = f" {label}: {buf}".ljust(w)[:w]
+                try: self.scr.addnstr(h - 1, 0, line, w, curses.A_REVERSE)
+                except curses.error: pass
+                self.scr.refresh()
+                ch = self.scr.getch()
+                if ch in (10, 13): return buf.strip() or None
+                if ch == 27: return None
+                if ch in (curses.KEY_BACKSPACE, 127, 8):
+                    buf = buf[:-1]; continue
+                if 32 <= ch < 127:
+                    buf += chr(ch)
+        finally:
+            curses.curs_set(0)
+
+    def picker(self, label: str, options: list) -> Optional[str]:
+        if not options: return None
+        h, w = self.scr.getmaxyx()
+        idx = 0
+        max_opt_w = max(len(o) for o in options)
+        box_w = max(20, min(w - 4, max_opt_w + 6))
+        box_h = min(h - 4, len(options) + 2)
+        by = max(0, (h - box_h) // 2)
+        bx = max(0, (w - box_w) // 2)
+        top = 0
+        while True:
+            for i in range(box_h):
+                self.addstr(by + i, bx, " " * box_w, curses.A_REVERSE, box_w)
+            self.addstr(by, bx, f" {label} ".ljust(box_w), curses.A_REVERSE | curses.A_BOLD, box_w)
+            inner_h = box_h - 1
+            if idx < top: top = idx
+            if idx >= top + inner_h: top = idx - inner_h + 1
+            for i in range(inner_h):
+                oi = top + i
+                if oi >= len(options): break
+                attr = curses.A_REVERSE | (curses.A_BOLD if oi == idx else 0)
+                marker = " > " if oi == idx else "   "
+                line = (marker + options[oi]).ljust(box_w)
+                self.addstr(by + 1 + i, bx, line, attr, box_w)
+            self.scr.refresh()
+            ch = self.scr.getch()
+            if ch in (curses.KEY_UP, ord("k")): idx = max(0, idx - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")): idx = min(len(options) - 1, idx + 1)
+            elif ch in (10, 13): return options[idx]
+            elif ch == 27: return None
+
+    # ---- actions ----
+    def exec_argv(self, argv: list):
+        self.last_action = " ".join(argv)
+        curses.def_prog_mode()
+        curses.endwin()
+        sys.stdout.write("\n$ " + " ".join(argv) + "\n")
+        sys.stdout.flush()
+        rc = 0
+        try:
+            rc = subprocess.run(argv, cwd=self.root).returncode
+        except FileNotFoundError as e:
+            sys.stdout.write(f"[error: {e}]\n")
+            rc = 127
+        sys.stdout.write(f"\n[exit {rc}] press Enter to return...")
+        sys.stdout.flush()
+        try: input()
+        except (EOFError, KeyboardInterrupt): pass
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        self.cmd_log.append(f"$ {' '.join(argv)}  \u2192 exit {rc}")
+        self.refresh_state()
+
+    def run_grov(self, args: list, confirm: Optional[str] = None):
+        if confirm and not self.confirm(confirm): return
+        self.exec_argv([GROV_BIN] + args)
+
+    def act_switch(self):
+        r = self.current()
+        if not r or not r.folder: return
+        self.run_grov(["switch", r.folder])
+
+    def act_new(self):
+        name = self.prompt("new branch off linked")
+        if not name: return
+        self.run_grov(["checkout", "-b", name])
+
+    def act_checkout(self):
+        name = self.prompt("checkout branch")
+        if not name: return
+        self.run_grov(["checkout", name])
+
+    def act_reparent(self):
+        r = self.current()
+        if not r: return
+        cands = set(self.state.nodes.keys()) | set(self.state.trunks)
+        for wt in self.state.worktrees.values():
+            if wt.head and wt.head != "?": cands.add(wt.head)
+        cands.discard(r.name)
+        options = sorted(cands)
+        if not options: return
+        newp = self.picker(f"new parent for {r.name}", options)
+        if not newp: return
+        self.run_grov(["parent", r.name, newp, "--yes"])
+
+    def act_push(self):
+        r = self.current()
+        if not r: return
+        target = r.head if r.kind == "orphan" else r.name
+        self.run_grov(["push", "--from", target, "--yes"], confirm=f"Push subtree from {target}?")
+
+    def act_restack(self):
+        in_prog = [wt for wt in self.state.worktrees.values() if wt.rebasing]
+        if in_prog:
+            choice = self.picker("rebase in progress", ["continue", "abort", "cancel"])
+            if choice == "continue": self.run_grov(["restack", "--continue"])
+            elif choice == "abort": self.run_grov(["restack", "--abort"])
+            return
+        self.run_grov(["restack"])
+
+    def act_remove(self):
+        r = self.current()
+        if not r or not r.folder: return
+        self.run_grov(["remove", r.folder], confirm=f"Remove worktree {r.folder}?")
+
+    def act_base(self):
+        r = self.current()
+        if not r: return
+        target = r.head if r.kind == "orphan" else r.name
+        self.run_grov(["base", target], confirm=f"Set base to {target}?")
+
+    def act_fetch(self):
+        bare = os.path.join(self.root, ".grov", "repo.git")
+        if os.path.isdir(bare):
+            self.exec_argv(["git", f"--git-dir={bare}", "fetch", "--all"])
+            return
+        primary = ""
+        try:
+            with open(os.path.join(self.root, ".grov", "primary-dir")) as f:
+                primary = f.read().strip()
+        except FileNotFoundError: pass
+        if primary:
+            p = os.path.join(self.root, BRANCHES, primary)
+            if os.path.isdir(p):
+                self.exec_argv(["git", "-C", p, "fetch", "--all"])
+
+    def act_help(self):
+        lines = [
+            "grov interactive  \u2014  help",
+            "",
+            "Navigation",
+            "  j / down       move down",
+            "  k / up         move up",
+            "  g / G          top / bottom",
+            "  /              filter (Enter applies, Esc clears)",
+            "  F5 / Ctrl-R    refresh",
+            "  ?              this help",
+            "  q              quit",
+            "",
+            "Actions  (run grov underneath; output shown after)",
+            "  Enter / c      switch workspace symlink to selected",
+            "  C              checkout existing branch by name (prompt)",
+            "  n              new branch off linked (grov checkout -b)",
+            "  p              reparent selected (pick new parent)",
+            "  P              push subtree from selected",
+            "  r              restack (or continue/abort if rebasing)",
+            "  d              remove selected worktree",
+            "  b              set selected as base",
+            "  f              git fetch --all",
+            "  s              toggle diff-stat in detail pane",
+            "",
+            "Press any key to close.",
+        ]
+        h, w = self.scr.getmaxyx()
+        box_w = min(w - 2, max(len(l) for l in lines) + 4)
+        box_h = min(h - 2, len(lines) + 2)
+        by = (h - box_h) // 2
+        bx = (w - box_w) // 2
+        for i in range(box_h):
+            self.addstr(by + i, bx, " " * box_w, curses.A_REVERSE, box_w)
+        for i, ln in enumerate(lines[:box_h - 2]):
+            self.addstr(by + 1 + i, bx + 2, ln[:box_w - 4], curses.A_REVERSE, box_w - 4)
+        self.scr.refresh()
+        self.scr.getch()
+
+    # ---- main loop ----
+    def loop(self):
+        self.refresh_state()
+        while True:
+            self.draw()
+            ch = self.scr.getch()
+            if self.filter_active:
+                if ch in (10, 13):
+                    self.filter_active = False
+                elif ch == 27:
+                    self.filter_active = False
+                    self.filter = ""
+                    self.rebuild_rows()
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    self.filter = self.filter[:-1]
+                    self.rebuild_rows()
+                elif 32 <= ch < 127:
+                    self.filter += chr(ch)
+                    self.rebuild_rows()
+                continue
+            if ch in (ord("q"),): break
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                if self.selectable: self.cursor = min(self.cursor + 1, len(self.selectable) - 1)
+            elif ch in (curses.KEY_UP, ord("k")):
+                if self.selectable: self.cursor = max(self.cursor - 1, 0)
+            elif ch == ord("g"): self.cursor = 0
+            elif ch == ord("G"): self.cursor = max(0, len(self.selectable) - 1)
+            elif ch == ord("/"):
+                self.filter_active = True
+                self.filter = ""
+                self.rebuild_rows()
+            elif ch in (curses.KEY_F5, 18): self.refresh_state()
+            elif ch in (10, 13, ord("c")): self.act_switch()
+            elif ch == ord("n"): self.act_new()
+            elif ch == ord("C"): self.act_checkout()
+            elif ch == ord("p"): self.act_reparent()
+            elif ch == ord("P"): self.act_push()
+            elif ch == ord("r"): self.act_restack()
+            elif ch == ord("d"): self.act_remove()
+            elif ch == ord("b"): self.act_base()
+            elif ch == ord("f"): self.act_fetch()
+            elif ch == ord("s"):
+                self.show_diff = not self.show_diff
+            elif ch == ord("?"): self.act_help()
+
+
+def init_colors():
+    if not curses.has_colors(): return
+    curses.start_color()
+    try: curses.use_default_colors()
+    except curses.error: pass
+    bg = -1
+    curses.init_pair(COLOR["clean"], curses.COLOR_GREEN, bg)
+    curses.init_pair(COLOR["dirty"], curses.COLOR_YELLOW, bg)
+    curses.init_pair(COLOR["diverged"], curses.COLOR_CYAN, bg)
+    curses.init_pair(COLOR["rebasing"], curses.COLOR_RED, bg)
+
+
+def run(stdscr, root):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    init_colors()
+    App(stdscr, root).loop()
+
+
+def find_root_from_cwd() -> Optional[str]:
+    d = os.getcwd()
+    while True:
+        if os.path.isdir(os.path.join(d, ".grov")): return d
+        new = os.path.dirname(d)
+        if new == d: return None
+        d = new
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    ap = argparse.ArgumentParser(prog="grov-interactive", description="grov interactive dashboard")
+    ap.add_argument("root", nargs="?", help="grov root (defaults to GROV_ROOT or auto-detect)")
+    args = ap.parse_args()
+    root = args.root or os.environ.get("GROV_ROOT") or find_root_from_cwd()
+    if not root or not os.path.isdir(os.path.join(root, ".grov")):
+        sys.stderr.write("Error: not inside a grov project (no .grov).\n")
+        sys.exit(1)
+    curses.wrapper(run, root)
+
+
+if __name__ == "__main__":
+    main()
