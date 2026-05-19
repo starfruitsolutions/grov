@@ -81,7 +81,7 @@ _grov_list_scripts() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout switch add status remove restack push parent base stack root branch branches path scripts run"
+  local commands="init restore checkout switch add status remove restack push commit exec parent base stack root branch branches path scripts run"
   if [[ $cword -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     return
@@ -121,6 +121,20 @@ _grov() {
         COMPREPLY=($(compgen -W "--yes --dry-run --from" -- "$cur"))
       elif [[ "$prev" == "--from" ]]; then
         COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      fi
+      ;;
+    commit)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "-b" -- "$cur"))
+      elif [[ "$prev" == "-b" ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+      fi
+      ;;
+    exec)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+      elif [[ $cword -eq 3 && "$prev" != "--" ]]; then
+        COMPREPLY=(--)
       fi
       ;;
     parent)

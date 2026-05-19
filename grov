@@ -19,6 +19,8 @@
 #   branch                  print active (linked) branch name
 #   branches                list worktree branch names
 #   path [branch]           print active workspace path, or path to branch worktree
+#   commit [-b <branch>] [git commit args...]   commit in a worktree without changing workspace link
+#   exec <branch> -- <cmd...>   run a command in a branch worktree (no link change)
 #   scripts                 list custom scripts in .grov/scripts
 #   run <name> [args...]    run .grov/scripts/<name>
 
@@ -323,6 +325,8 @@ usage() {
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
   echo "  stack doctor             validate stack.json vs branches/"
+  echo "  commit [-b <branch>] [git commit args...]   commit in worktree (default: linked)"
+  echo "  exec <branch> -- <cmd...>   run command in worktree (no link change)"
   echo "  root | branch | branches | path | scripts"
   echo "  run <name> [args...]     run .grov/scripts/<name>"
   exit 1
@@ -1207,6 +1211,52 @@ for b in reversed(chain):
 PY
 }
 
+worktree_in_rebase() {
+  local wt_path=$1
+  local gp sub
+  for sub in rebase-merge rebase-apply; do
+    gp=$(git -C "$wt_path" rev-parse --git-path "$sub" 2>/dev/null || true)
+    if [[ -n "$gp" && -d "$gp" ]]; then return 0; fi
+  done
+  return 1
+}
+
+cmd_commit() {
+  local root=$1
+  shift
+  local branch=""
+  if [[ "$1" == "-b" ]]; then
+    branch="$2"
+    shift 2
+    [[ -z "$branch" ]] && echo "Usage: grov commit [-b <branch>] [git commit args...]" >&2 && exit 1
+  fi
+  [[ -z "$branch" ]] && branch=$(get_linked_branch "$root")
+  [[ -z "$branch" ]] && { echo "Error: No -b given and no linked workspace." >&2; exit 1; }
+  local wt_path
+  wt_path=$(get_worktree_path "$root" "$branch")
+  [[ ! -d "$wt_path" ]] && { echo "Error: No worktree at $wt_path. Use: grov add $branch" >&2; exit 1; }
+  if worktree_in_rebase "$wt_path"; then
+    echo "Error: '$branch' is mid-rebase; resolve with grov restack --continue first." >&2
+    exit 1
+  fi
+  git -C "$wt_path" commit "$@"
+}
+
+cmd_exec() {
+  local root=$1
+  shift
+  local branch="${1:-}"
+  shift || true
+  [[ -z "$branch" || "${1:-}" != "--" ]] && { echo "Usage: grov exec <branch> -- <cmd...>" >&2; exit 1; }
+  shift
+  [[ $# -eq 0 ]] && { echo "Usage: grov exec <branch> -- <cmd...>" >&2; exit 1; }
+  local wt_path
+  wt_path=$(get_worktree_path "$root" "$branch")
+  [[ ! -d "$wt_path" ]] && { echo "Error: No worktree at $wt_path." >&2; exit 1; }
+  export GROV_ROOT="$root"
+  cd "$wt_path" && exec "$@"
+}
+
 cmd_push() {
   local root=$1
   shift
@@ -1577,6 +1627,8 @@ case "$cmd" in
   remove)     cmd_remove "$GROV_ROOT" "$@" ;;
   restack)    cmd_restack "$GROV_ROOT" "$@" ;;
   push)       cmd_push "$GROV_ROOT" "$@" ;;
+  commit)     cmd_commit "$GROV_ROOT" "$@" ;;
+  exec)       cmd_exec "$GROV_ROOT" "$@" ;;
   parent)     cmd_parent "$GROV_ROOT" "$@" ;;
   base)       cmd_base "$GROV_ROOT" "$@" ;;
   root)       cmd_root "$GROV_ROOT" ;;

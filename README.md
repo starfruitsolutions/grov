@@ -49,6 +49,8 @@ grov push                 # push subtree of stacked branches with --force-with-l
 | `stack remove <branch>` | Remove leaf from stack metadata + worktree |
 | `stack doctor` | Validate `stack.json` vs actual worktrees |
 | `root` / `branch` / `branches` / `path [branch]` | Introspection helpers |
+| `commit [-b <branch>] [git commit args...]` | Commit in a worktree without changing the `workspace` link |
+| `exec <branch> -- <cmd...>` | Run any command in a branch worktree (no link change) |
 | `scripts` / `run <name> [args...]` | List and run custom scripts in `.grov/scripts/` |
 
 ## Interactive TUI
