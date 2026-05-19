@@ -1170,11 +1170,22 @@ cmd_push() {
     d=${info#* }
     wt_path=$(get_worktree_path "$root" "${d%% *}")
     wt_path=$(readlink -f "$wt_path" 2>/dev/null || echo "$wt_path")
-    ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
     if ! git -C "$wt_path" rev-parse @{u} &>/dev/null; then
-      echo "  $br: no upstream — skipped (set upstream first)"
+      local remote="origin"
+      if [[ "$yes" != true ]]; then
+        echo -n "  $br: no upstream. Push --set-upstream to remote [origin]: "
+        read -r remote_input
+        [[ -n "$remote_input" ]] && remote="$remote_input"
+      fi
+      if [[ "$dry" == true ]]; then
+        echo "    dry-run: git push --set-upstream $remote $br"
+        continue
+      fi
+      echo "  $br: setting upstream to $remote/$br"
+      git -C "$wt_path" push --set-upstream "$remote" "$br"
       continue
     fi
+    ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
     if [[ "$ahead" == "0" ]]; then
       echo "  $br: nothing to push"
       continue
