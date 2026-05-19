@@ -1172,17 +1172,25 @@ cmd_push() {
     wt_path=$(readlink -f "$wt_path" 2>/dev/null || echo "$wt_path")
     if ! git -C "$wt_path" rev-parse @{u} &>/dev/null; then
       local remote="origin"
+      local push_branch="$br"
       if [[ "$yes" != true ]]; then
-        echo -n "  $br: no upstream. Push --set-upstream to remote [origin]: "
-        read -r remote_input </dev/tty
-        [[ -n "$remote_input" ]] && remote="$remote_input"
+        echo -n "  $br: no upstream. Push --set-upstream to [$remote/$push_branch]: "
+        read -r upstream_input </dev/tty
+        if [[ -n "$upstream_input" ]]; then
+          if [[ "$upstream_input" == */* ]]; then
+            remote="${upstream_input%%/*}"
+            push_branch="${upstream_input#*/}"
+          else
+            remote="$upstream_input"
+          fi
+        fi
       fi
       if [[ "$dry" == true ]]; then
-        echo "    dry-run: git push --set-upstream $remote $br"
+        echo "    dry-run: git push --set-upstream $remote $br:$push_branch"
         continue
       fi
-      echo "  $br: setting upstream to $remote/$br"
-      git -C "$wt_path" push --set-upstream "$remote" "$br"
+      echo "  $br: setting upstream to $remote/$push_branch"
+      git -C "$wt_path" push --set-upstream "$remote" "$br:$push_branch"
       continue
     fi
     ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
