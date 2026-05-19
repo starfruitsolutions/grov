@@ -1004,7 +1004,23 @@ def get_state(wt, compare_to=None):
     except subprocess.CalledProcessError:
         return ("unknown", "?")
     if s.strip():
-        return ("dirty", "uncommitted")
+        ins = dels = 0
+        try:
+            shortstat = subprocess.check_output(
+                ["git", "-C", wt, "diff", "HEAD", "--shortstat"],
+                stderr=subprocess.DEVNULL, text=True
+            )
+            m = re.search(r"(\d+) insertion", shortstat)
+            if m: ins = int(m.group(1))
+            m = re.search(r"(\d+) deletion", shortstat)
+            if m: dels = int(m.group(1))
+        except subprocess.CalledProcessError:
+            pass
+        parts = [c(YELLOW, "uncommitted")]
+        if ins or dels:
+            parts.append(c(GREEN, f"+{ins}"))
+            parts.append(c(RED, f"-{dels}"))
+        return ("preformatted", " ".join(parts))
     ref = compare_to if compare_to else "@{u}"
     try:
         ahead = int(subprocess.check_output(
