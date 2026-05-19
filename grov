@@ -10,7 +10,7 @@
 #   status [--no-fetch]     list worktrees, stack tree, linked branch, git state (fetches by default)
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
 #   restack [--continue|--abort]   rebase stacked branches onto parents (ordered)
-#   push [--yes] [--dry-run] [--from <b>]   push linked branch subtree with --force-with-lease
+#   push [<branch>|<a>..<b>] [--subtree [<from>]] [--yes] [--dry-run]   push branches with --force-with-lease (default: linked branch)
 #   parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (defaults parent to base)
 #   base [<branch>]         show or set the global base (trunk) branch
 #   stack remove <branch>   remove leaf from stack metadata + worktree
@@ -318,7 +318,7 @@ usage() {
   echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
   echo "  remove <branch>          remove worktree (stack branch must be a leaf)"
   echo "  restack [--continue|--abort]   rebase stacked branches (parent order)"
-  echo "  push [--yes] [--dry-run] [--from <branch>]   push subtree with --force-with-lease"
+  echo "  push [<branch>|<a>..<b>] [--subtree [<f>]] [--yes] [--dry-run]   push branches (default: linked)"
   echo "  parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (default parent=base)"
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
@@ -1179,35 +1179,98 @@ for b in sorted(seen, key=lambda x: (depth(x), x)):
 PY
 }
 
+# Walk parent chain from <to> (incl) up to <from> (excl); emits parent-first.
+collect_stack_range() {
+  local root=$1
+  local from=$2
+  local to=$3
+  require_python3
+  python3 - "$root" "$from" "$to" <<'PY'
+import json, os, sys
+root, frm, to = sys.argv[1:4]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+chain = []
+cur = to
+while cur != frm:
+    chain.append(cur)
+    if cur not in nodes:
+        print(f"Error: '{cur}' is not in the stack; cannot walk to '{frm}'.", file=sys.stderr)
+        sys.exit(1)
+    p = nodes[cur].get("parent")
+    if not p:
+        print(f"Error: '{frm}' is not an ancestor of '{to}' in the stack.", file=sys.stderr)
+        sys.exit(1)
+    cur = p
+for b in reversed(chain):
+    print(b)
+PY
+}
+
 cmd_push() {
   local root=$1
   shift
   local yes=false dry=false
-  local from_branch=""
+  local subtree=false
+  local subtree_from=""
+  local positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) yes=true ;;
       --dry-run) dry=true ;;
+      --subtree) subtree=true ;;
       --from)
         shift
-        from_branch="${1:-}"
-        [[ -z "$from_branch" ]] && echo "Usage: grov push [--yes] [--dry-run] [--from <branch>]" >&2 && exit 1
+        subtree=true
+        subtree_from="${1:-}"
+        [[ -z "$subtree_from" ]] && echo "Usage: grov push --from <branch>" >&2 && exit 1
         ;;
-      *) echo "Unknown option: $1" >&2; exit 1 ;;
+      -*) echo "Unknown option: $1" >&2; exit 1 ;;
+      *) positional+=("$1") ;;
     esac
     shift
   done
   stack_ensure_file "$root"
   require_python3
-  [[ -z "$from_branch" ]] && from_branch=$(get_linked_git_branch "$root" || true)
-  [[ -z "$from_branch" ]] && from_branch=$(get_linked_branch "$root" || true)
-  [[ -z "$from_branch" ]] && {
-    echo "Error: No linked branch; pass --from <branch>." >&2
-    exit 1
-  }
 
-  local br wt_path ahead behind
-  echo "Push subtree from '$from_branch' (ordered parent-before-child):"
+  if [[ "$subtree" == true && ${#positional[@]} -gt 0 ]]; then
+    echo "Error: cannot combine --subtree/--from with a positional branch argument." >&2
+    exit 1
+  fi
+
+  local branches_list="" header=""
+  if [[ "$subtree" == true ]]; then
+    local start="$subtree_from"
+    [[ -z "$start" ]] && start=$(get_linked_git_branch "$root" 2>/dev/null || true)
+    [[ -z "$start" ]] && start=$(get_linked_branch "$root" 2>/dev/null || true)
+    [[ -z "$start" ]] && { echo "Error: No linked branch; pass --from <branch>." >&2; exit 1; }
+    branches_list=$(collect_subtree_branches "$root" "$start")
+    header="Push subtree from '$start' (ordered parent-before-child):"
+  elif [[ ${#positional[@]} -eq 0 ]]; then
+    local cur
+    cur=$(get_linked_git_branch "$root" 2>/dev/null || true)
+    [[ -z "$cur" ]] && cur=$(get_linked_branch "$root" 2>/dev/null || true)
+    [[ -z "$cur" ]] && { echo "Error: No linked branch." >&2; exit 1; }
+    branches_list="$cur"
+    header="Push '$cur':"
+  elif [[ ${#positional[@]} -eq 1 && "${positional[0]}" == *..* ]]; then
+    local arg="${positional[0]}"
+    [[ "$arg" == *..*..* ]] && { echo "Error: invalid range syntax '$arg' (expected <a>..<b>)." >&2; exit 1; }
+    local from_b="${arg%%..*}"
+    local to_b="${arg##*..}"
+    [[ -z "$from_b" || -z "$to_b" ]] && { echo "Usage: grov push <a>..<b>" >&2; exit 1; }
+    branches_list=$(collect_stack_range "$root" "$from_b" "$to_b") || exit 1
+    header="Push chain '$from_b..$to_b' (ordered parent-before-child):"
+  elif [[ ${#positional[@]} -eq 1 ]]; then
+    branches_list="${positional[0]}"
+    header="Push '${positional[0]}':"
+  else
+    echo "Usage: grov push [<branch>|<a>..<b>] [--subtree [<from>] | --from <from>] [--yes] [--dry-run]" >&2
+    exit 1
+  fi
+
+  echo "$header"
+  local br wt_path ahead
   while IFS= read -r br; do
     [[ -z "$br" ]] && continue
     materialize_worktree_if_needed "$root" "$br"
@@ -1257,7 +1320,7 @@ cmd_push() {
       [[ "$ans" != [yY]* ]] && continue
     fi
     git -C "$wt_path" push --force-with-lease origin "$br"
-  done < <(collect_subtree_branches "$root" "$from_branch")
+  done <<<"$branches_list"
 }
 
 cmd_parent() {
