@@ -19,16 +19,22 @@
 #   branch                  print active (linked) branch name
 #   branches                list worktree branch names
 #   path [branch]           print active workspace path, or path to branch worktree
-#   commit [-b <branch>] [git commit args...]   commit in a worktree without changing workspace link
+#   mount <name> <branch>   add optional mount symlink at repo root
+#   unmount <name>          remove an optional mount (not workspace)
+#   mounts                  list mounts (workspace is required)
+#   work [<target>]         subshell in a worktree (default: workspace mount; no mount change)
+#   merge [<branch-a>] [<branch-b>]   merge branch-a into branch-b (default target: workspace)
 #   exec <branch> -- <cmd...>   run a command in a branch worktree (no link change)
 #   scripts                 list custom scripts in .grov/scripts
 #   run <name> [args...]    run .grov/scripts/<name>
 
 set -e
 LINK_NAME="workspace"
+WORKSPACE_MOUNT="workspace"
 BRANCHES_DIR_NAME="branches"
 BARE_REPO=".grov/repo.git"
 STACK_JSON=".grov/stack.json"
+MOUNTS_JSON=".grov/mounts.json"
 
 require_python3() {
   command -v python3 &>/dev/null || {
@@ -91,6 +97,144 @@ resolve_base() {
     b=$(cat "$root/.grov/primary-branch" 2>/dev/null) || true
   fi
   echo "$b"
+}
+
+mounts_path() {
+  echo "$1/$MOUNTS_JSON"
+}
+
+mounts_ensure_file() {
+  local root=$1
+  local p
+  p=$(mounts_path "$root")
+  if [[ -f "$p" ]]; then return 0; fi
+  require_python3
+  mkdir -p "$root/.grov"
+  python3 - "$root" "$WORKSPACE_MOUNT" "$LINK_NAME" "$BRANCHES_DIR_NAME" <<'PY'
+import json, os, sys
+root, ws_name, link_name, branches = sys.argv[1:5]
+folder = ""
+link = os.path.join(root, link_name)
+if os.path.islink(link):
+    target = os.readlink(link)
+    folder = os.path.basename(target.rstrip("/"))
+if not folder:
+    bd = os.path.join(root, branches)
+    if os.path.isdir(bd):
+        for name in sorted(os.listdir(bd)):
+            if os.path.isdir(os.path.join(bd, name)):
+                folder = name
+                break
+mounts = {ws_name: folder} if folder else {ws_name: ""}
+with open(os.path.join(root, ".grov", "mounts.json"), "w") as f:
+    json.dump({"version": 1, "mounts": mounts}, f, indent=2)
+PY
+}
+
+mounts_get_folder() {
+  local root=$1
+  local mount_name=$2
+  require_python3
+  mounts_ensure_file "$root"
+  python3 - "$root" "$mount_name" <<'PY'
+import json, sys
+root, name = sys.argv[1:3]
+with open(f"{root}/.grov/mounts.json") as f:
+    d = json.load(f)
+print((d.get("mounts") or {}).get(name) or "")
+PY
+}
+
+mounts_list_names() {
+  local root=$1
+  require_python3
+  mounts_ensure_file "$root"
+  python3 - "$root" <<'PY'
+import json, sys
+root = sys.argv[1]
+with open(f"{root}/.grov/mounts.json") as f:
+    mounts = json.load(f).get("mounts") or {}
+for name in sorted(mounts.keys()):
+    print(name)
+PY
+}
+
+mounts_set_folder() {
+  local root=$1
+  local mount_name=$2
+  local folder=$3
+  require_python3
+  mounts_ensure_file "$root"
+  python3 - "$root" "$mount_name" "$folder" <<'PY'
+import json, sys
+root, name, folder = sys.argv[1:4]
+path = f"{root}/.grov/mounts.json"
+with open(path) as f:
+    d = json.load(f)
+mounts = d.setdefault("mounts", {})
+mounts[name] = folder
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+mounts_remove_name() {
+  local root=$1
+  local mount_name=$2
+  require_python3
+  python3 - "$root" "$mount_name" <<'PY'
+import json, sys
+root, name = sys.argv[1:3]
+path = f"{root}/.grov/mounts.json"
+with open(path) as f:
+    d = json.load(f)
+mounts = d.setdefault("mounts", {})
+mounts.pop(name, None)
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
+mount_name_valid() {
+  local name=$1
+  [[ "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || return 1
+  [[ "$name" != "$BRANCHES_DIR_NAME" && "$name" != ".grov" && "$name" != ".git" ]] || return 1
+  return 0
+}
+
+apply_mount_symlink() {
+  local root=$1
+  local mount_name=$2
+  local folder=$3
+  local link_path
+  link_path=$(cd "$root" && pwd)/$mount_name
+  ln -sfn "$BRANCHES_DIR_NAME/$folder" "$link_path"
+}
+
+set_workspace_mount() {
+  local root=$1
+  local folder=$2
+  mounts_set_folder "$root" "$WORKSPACE_MOUNT" "$folder"
+  apply_mount_symlink "$root" "$WORKSPACE_MOUNT" "$folder"
+}
+
+# Resolve mount name, git branch, or worktree folder to a folder under branches/.
+resolve_target_folder() {
+  local root=$1
+  local target=$2
+  local folder
+  mounts_ensure_file "$root"
+  folder=$(mounts_get_folder "$root" "$target")
+  if [[ -n "$folder" ]]; then
+    echo "$folder"
+    return 0
+  fi
+  folder=$(resolve_worktree_folder "$root" "$target" 2>/dev/null) || folder="$target"
+  if [[ -d "$(get_worktree_path "$root" "$folder")" ]]; then
+    echo "$folder"
+    return 0
+  fi
+  return 1
 }
 
 stack_get_parent() {
@@ -348,24 +492,26 @@ find_dev_root() {
 
 ensure_workspace() {
   local root=$1
-  local link_path
-  link_path=$(cd "$root" && pwd)/$LINK_NAME
-  if [[ -L "$link_path" ]]; then return 0; fi
-  local branches_dir="$root/$BRANCHES_DIR_NAME"
-  [[ ! -d "$branches_dir" ]] && return 1
-  local first
-  first=$(ls -1d "$branches_dir"/*/ 2>/dev/null | head -1)
-  [[ -z "$first" ]] && return 1
-  ln -sfn "$BRANCHES_DIR_NAME/$(basename "$first")" "$link_path"
+  mounts_ensure_file "$root" || return 1
+  local folder
+  folder=$(mounts_get_folder "$root" "$WORKSPACE_MOUNT")
+  [[ -z "$folder" ]] && return 1
+  local wt_path
+  wt_path=$(get_worktree_path "$root" "$folder")
+  [[ ! -d "$wt_path" ]] && return 1
+  apply_mount_symlink "$root" "$WORKSPACE_MOUNT" "$folder"
+  return 0
 }
 
 get_linked_branch() {
   local root=$1
   ensure_workspace "$root" || true
-  local link_path
+  local folder
+  folder=$(mounts_get_folder "$root" "$WORKSPACE_MOUNT" 2>/dev/null) || true
+  [[ -n "$folder" ]] && echo "$folder" && return 0
+  local link_path target
   link_path=$(cd "$root" && pwd)/$LINK_NAME
   if [[ ! -L "$link_path" ]]; then echo ""; return 1; fi
-  local target
   target=$(readlink -f "$link_path")
   [[ -z "$target" ]] && echo "" && return 1
   basename "$target"
@@ -421,7 +567,11 @@ usage() {
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
   echo "  stack doctor             validate stack.json vs branches/"
-  echo "  commit [-b <branch>] [git commit args...]   commit in worktree (default: linked)"
+  echo "  mount <name> <branch>    add optional mount symlink at repo root"
+  echo "  unmount <name>           remove optional mount (not workspace)"
+  echo "  mounts                   list mounts"
+  echo "  work [<target>]          subshell in worktree (default: workspace; mounts unchanged)"
+  echo "  merge [<branch-a>] [<branch-b>]   merge branch-a into branch-b (default target: workspace)"
   echo "  exec <branch> -- <cmd...>   run command in worktree (no link change)"
   echo "  root | branch | branches | path | scripts"
   echo "  run <name> [args...]     run .grov/scripts/<name>"
@@ -572,9 +722,8 @@ cmd_init() {
     exit 1
   fi
   git --git-dir="$root/$BARE_REPO" worktree add "$wt_path" "$branch"
-  local link_path
-  link_path=$(cd "$root" && pwd)/$LINK_NAME
-  ln -sfn "$BRANCHES_DIR_NAME/$branch_dir" "$link_path"
+  printf '%s\n' "{\"version\":1,\"mounts\":{\"$WORKSPACE_MOUNT\":\"$branch_dir\"}}" >"$root/$MOUNTS_JSON"
+  apply_mount_symlink "$root" "$WORKSPACE_MOUNT" "$branch_dir"
   find "$root" -mindepth 1 -maxdepth 1 ! -name .grov ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
   rm -rf "$root/.git"
   printf '%s\n' '{"version":1,"nodes":{}}' >"$root/$STACK_JSON"
@@ -639,10 +788,7 @@ cmd_switch() {
     echo "Error: Worktree does not exist. Use: grov checkout <branch> or grov add <branch>" >&2
     exit 1
   fi
-  ensure_workspace "$root" || true
-  local link_path
-  link_path=$(cd "$root" && pwd)/$LINK_NAME
-  ln -sfn "$BRANCHES_DIR_NAME/$branch" "$link_path"
+  set_workspace_mount "$root" "$branch"
 }
 
 cmd_add() {
@@ -1458,25 +1604,170 @@ worktree_in_rebase() {
   return 1
 }
 
-cmd_commit() {
+worktree_path_for_branch() {
+  local root=$1
+  local branch=$2
+  local folder wt_path
+  folder=$(resolve_worktree_folder "$root" "$branch" 2>/dev/null) || folder="$branch"
+  wt_path=$(readlink -f "$(get_worktree_path "$root" "$folder")" 2>/dev/null || get_worktree_path "$root" "$folder")
+  if [[ ! -d "$wt_path" ]]; then
+    ensure_worktree "$root" false "$branch"
+    folder=$(resolve_worktree_folder "$root" "$branch" 2>/dev/null) || folder="$branch"
+    wt_path=$(readlink -f "$(get_worktree_path "$root" "$folder")" 2>/dev/null || get_worktree_path "$root" "$folder")
+  fi
+  [[ -d "$wt_path" ]] || return 1
+  echo "$wt_path"
+}
+
+cmd_mount() {
   local root=$1
   shift
-  local branch=""
-  if [[ "$1" == "-b" ]]; then
-    branch="$2"
-    shift 2
-    [[ -z "$branch" ]] && echo "Usage: grov commit [-b <branch>] [git commit args...]" >&2 && exit 1
+  local name="$1" branch="$2"
+  [[ -z "$name" || -z "$branch" ]] && { echo "Usage: grov mount <name> <branch>" >&2; exit 1; }
+  [[ "$name" == "$WORKSPACE_MOUNT" ]] && {
+    echo "Error: Use grov checkout/switch to change the workspace mount." >&2
+    exit 1
+  }
+  mount_name_valid "$name" || {
+    echo "Error: Invalid mount name '$name' (use letters, digits, _, -; not branches/.grov/.git)." >&2
+    exit 1
+  }
+  [[ -e "$root/$name" && ! -L "$root/$name" ]] && {
+    echo "Error: '$name' exists and is not a symlink." >&2
+    exit 1
+  }
+  ensure_worktree "$root" false "$branch"
+  local folder
+  folder=$(resolve_target_folder "$root" "$branch") || {
+    echo "Error: Could not resolve worktree for '$branch'." >&2
+    exit 1
+  }
+  mounts_set_folder "$root" "$name" "$folder"
+  apply_mount_symlink "$root" "$name" "$folder"
+  echo "Mounted $name -> branches/$folder"
+}
+
+cmd_unmount() {
+  local root=$1
+  shift
+  local name="$1"
+  [[ -z "$name" ]] && { echo "Usage: grov unmount <name>" >&2; exit 1; }
+  [[ "$name" == "$WORKSPACE_MOUNT" ]] && {
+    echo "Error: Cannot unmount required mount '$WORKSPACE_MOUNT'." >&2
+    exit 1
+  }
+  mounts_ensure_file "$root"
+  local folder
+  folder=$(mounts_get_folder "$root" "$name")
+  [[ -z "$folder" ]] && { echo "Error: No mount named '$name'." >&2; exit 1; }
+  mounts_remove_name "$root" "$name"
+  local link_path
+  link_path=$(cd "$root" && pwd)/$name
+  [[ -L "$link_path" || -e "$link_path" ]] && rm -f "$link_path"
+  echo "Unmounted $name"
+}
+
+cmd_mounts() {
+  local root=$1
+  mounts_ensure_file "$root"
+  require_python3
+  python3 - "$root" "$BRANCHES_DIR_NAME" <<'PY'
+import json, os, sys
+root, branches = sys.argv[1:3]
+with open(os.path.join(root, ".grov", "mounts.json")) as f:
+    mounts = json.load(f).get("mounts") or {}
+for name in sorted(mounts.keys()):
+    folder = mounts[name] or "?"
+    link = os.path.join(root, name)
+    path = ""
+    if os.path.islink(link):
+        path = os.path.realpath(link)
+    elif folder and folder != "?":
+        path = os.path.join(root, branches, folder)
+    print(f"{name}\t{folder}\t{path}")
+PY
+}
+
+cmd_work() {
+  local root=$1
+  shift
+  local target="${1:-}" via_mount="" folder wt_path ws_folder git_branch shell
+  if [[ -z "$target" ]]; then
+    folder=$(get_linked_branch "$root") || {
+      echo "Error: No workspace mount; use: grov work <branch|mount>" >&2
+      exit 1
+    }
+    target="$folder"
+  else
+    mounts_ensure_file "$root"
+    local mount_folder
+    mount_folder=$(mounts_get_folder "$root" "$target")
+    if [[ -n "$mount_folder" ]]; then
+      folder="$mount_folder"
+      via_mount="$target"
+    fi
   fi
-  [[ -z "$branch" ]] && branch=$(get_linked_branch "$root")
-  [[ -z "$branch" ]] && { echo "Error: No -b given and no linked workspace." >&2; exit 1; }
-  local wt_path
-  wt_path=$(get_worktree_path "$root" "$branch")
-  [[ ! -d "$wt_path" ]] && { echo "Error: No worktree at $wt_path. Use: grov add $branch" >&2; exit 1; }
+  [[ -z "$folder" ]] && folder=$(resolve_target_folder "$root" "$target") || {
+    echo "Error: Could not resolve '$target'. Use: grov add <branch>" >&2
+    exit 1
+  }
+  wt_path=$(worktree_path_for_branch "$root" "$folder") || {
+    echo "Error: No worktree for '$folder'." >&2
+    exit 1
+  }
   if worktree_in_rebase "$wt_path"; then
-    echo "Error: '$branch' is mid-rebase; resolve with grov restack --continue first." >&2
+    echo "Error: '$folder' is mid-rebase; resolve with grov restack --continue first." >&2
     exit 1
   fi
-  git -C "$wt_path" commit "$@"
+  ws_folder=$(get_linked_branch "$root" 2>/dev/null) || ws_folder="(none)"
+  git_branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || git_branch="$folder"
+  [[ "$git_branch" == "HEAD" ]] && git_branch="$folder"
+  echo "grov work: $git_branch @ $wt_path (workspace mount still: $ws_folder)${via_mount:+ via mount $via_mount}"
+  export GROV_ROOT="$root"
+  export GROV_WT="$wt_path"
+  export GROV_BRANCH="$git_branch"
+  export GROV_WORKSPACE_MOUNT="$ws_folder"
+  [[ -n "$via_mount" ]] && export GROV_MOUNT="$via_mount"
+  shell=${SHELL:-/bin/bash}
+  cd "$wt_path" && exec "$shell"
+}
+
+cmd_merge() {
+  local root=$1
+  shift
+  local source="" target=""
+  case $# in
+    0)
+      echo "Usage: grov merge [<branch-a>] [<branch-b>]" >&2
+      exit 1
+      ;;
+    1) source="$1" ;;
+    2) source="$1"; target="$2" ;;
+    *)
+      echo "Usage: grov merge [<branch-a>] [<branch-b>]" >&2
+      exit 1
+      ;;
+  esac
+  [[ -z "$target" ]] && target=$(get_linked_git_branch "$root" 2>/dev/null || true)
+  [[ -z "$target" ]] && target=$(get_linked_branch "$root")
+  [[ -z "$target" ]] && { echo "Error: No target branch; link workspace or pass two branch names." >&2; exit 1; }
+  local source_wt target_wt source_ref
+  source_wt=$(worktree_path_for_branch "$root" "$source") || {
+    echo "Error: No worktree for source branch '$source'." >&2
+    exit 1
+  }
+  target_wt=$(worktree_path_for_branch "$root" "$target") || {
+    echo "Error: No worktree for target branch '$target'." >&2
+    exit 1
+  }
+  if worktree_in_rebase "$target_wt"; then
+    echo "Error: '$target' is mid-rebase; resolve with grov restack --continue first." >&2
+    exit 1
+  fi
+  source_ref=$(git -C "$source_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || source_ref="$source"
+  [[ "$source_ref" == "HEAD" ]] && source_ref="$source"
+  echo "Merge $source_ref into $target (in $target_wt)"
+  git -C "$target_wt" merge "$source_ref"
 }
 
 cmd_exec() {
@@ -1853,8 +2144,14 @@ cmd_restore() {
     fi
   done < <(git --git-dir="$bare" remote 2>/dev/null)
   cd /tmp 2>/dev/null || cd "$root/.." || true
-  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" "$root/$LINK_NAME" || {
-    echo "Error: Failed to remove .grov, branches, or workspace." >&2
+  mounts_ensure_file "$root" 2>/dev/null || true
+  local mname
+  while IFS= read -r mname; do
+    [[ -z "$mname" ]] && continue
+    [[ -L "$root/$mname" || -e "$root/$mname" ]] && rm -f "$root/$mname"
+  done < <(mounts_list_names "$root" 2>/dev/null || true)
+  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" || {
+    echo "Error: Failed to remove .grov or branches." >&2
     rm -rf "$tmp"
     exit 1
   }
@@ -1904,7 +2201,11 @@ case "$cmd" in
   remove)     cmd_remove "$GROV_ROOT" "$@" ;;
   restack)    cmd_restack "$GROV_ROOT" "$@" ;;
   push)       cmd_push "$GROV_ROOT" "$@" ;;
-  commit)     cmd_commit "$GROV_ROOT" "$@" ;;
+  mount)      cmd_mount "$GROV_ROOT" "$@" ;;
+  unmount)    cmd_unmount "$GROV_ROOT" "$@" ;;
+  mounts)     cmd_mounts "$GROV_ROOT" ;;
+  work)       cmd_work "$GROV_ROOT" "$@" ;;
+  merge)      cmd_merge "$GROV_ROOT" "$@" ;;
   exec)       cmd_exec "$GROV_ROOT" "$@" ;;
   parent)     cmd_parent "$GROV_ROOT" "$@" ;;
   base)       cmd_base "$GROV_ROOT" "$@" ;;

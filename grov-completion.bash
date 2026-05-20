@@ -67,6 +67,21 @@ _grov_list_git_branches() {
   fi
 }
 
+_grov_list_mounts() {
+  local root
+  root=$(_grov_find_root) || return
+  local line name
+  while IFS=$'\t' read -r name _ _; do
+    [[ -n "$name" ]] && echo "$name"
+  done < <(command grov mounts 2>/dev/null)
+}
+
+_grov_list_work_targets() {
+  _grov_list_mounts
+  _grov_list_branches
+  _grov_list_git_branches
+}
+
 _grov_list_scripts() {
   local root
   root=$(_grov_find_root) || return
@@ -141,7 +156,7 @@ _grov_complete_push() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout switch add status remove restack push commit exec parent base stack interactive root branch branches path scripts run"
+  local commands="init restore checkout switch add status remove restack push mount unmount mounts work merge exec parent base stack interactive root branch branches path scripts run"
   if [[ $cword -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     return
@@ -180,11 +195,23 @@ _grov() {
       compopt +o default 2>/dev/null
       _grov_complete_push
       ;;
-    commit)
+    mount)
+      compopt +o default 2>/dev/null
+      [[ $cword -eq 3 ]] && COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      ;;
+    unmount)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_mounts)" -- "$cur"))
+      ;;
+    mounts) ;;
+    work)
+      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_work_targets)" -- "$cur"))
+      ;;
+    merge)
+      compopt +o default 2>/dev/null
       if [[ $cword -eq 2 ]]; then
-        COMPREPLY=($(compgen -W "-b" -- "$cur"))
-      elif [[ "$prev" == "-b" ]]; then
-        COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
+      elif [[ $cword -eq 3 ]]; then
+        COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
       fi
       ;;
     exec)

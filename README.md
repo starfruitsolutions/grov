@@ -1,6 +1,6 @@
 # grov
 
-A bash CLI for working in **git worktrees** with a stable `workspace/` symlink and lightweight **stacked-branch** metadata. One repo, many branches checked out at once, easy switching, and a sane mental model for stacks on top of plain git.
+A bash CLI for working in **git worktrees** with a stable `workspace/` mount, optional extra mounts, and lightweight **stacked-branch** metadata. One repo, many branches checked out at once, easy switching, and a sane mental model for stacks on top of plain git.
 
 ## Why
 
@@ -8,8 +8,9 @@ Switching branches with `git checkout` blows away your working tree and IDE stat
 
 - The bare repo lives at `.grov/repo.git`
 - Every branch you touch becomes a worktree under `branches/<name>/`
-- A `workspace` symlink always points at the branch you're currently working on — open your editor on `workspace/` once and forget about it
-- Stack relationships (which branch is on top of which) live in `.grov/stack.json` and drive `restack`, `push`, and `status`
+- A required **`workspace`** mount points at your primary dev tree (IDE-friendly)
+- Optional **named mounts** (e.g. `dock/`) point at other worktrees without moving `workspace`
+- Stack relationships live in `.grov/stack.json` and drive `restack`, `push`, and `status`
 
 ## Install
 
@@ -27,19 +28,32 @@ The installer offers to add `~/.local/bin` to your `PATH` and source the bash co
 cd path/to/your/git/repo
 grov init                 # convert existing repo into the grov layout
 grov checkout -b feature  # create branch, worktree, point workspace at it
-cd workspace              # always your current branch
-# ...edit, commit...
+cd workspace              # primary dev tree
+# ...edit, git add, git commit...
 grov push                 # push subtree of stacked branches with --force-with-lease
 ```
+
+## Mounts vs work vs checkout
+
+| Goal | Command |
+|------|---------|
+| Live dev on branch A | `workspace` mount (`grov checkout A` moves it) |
+| Second tree in IDE/files | `grov mount dock B` then open `dock/` |
+| Terminal git session on B without moving workspace | `grov work B` (subshell; `exit` when done) |
+| One-shot merge into linked branch | `grov merge other-branch` |
+
+- **`checkout` / `switch`** — repoint only the **`workspace`** mount.
+- **`mount` / `unmount`** — add or remove optional symlinks; `workspace` cannot be unmounted.
+- **`work`** — ephemeral shell in a worktree; does not change any mount.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `init` | Convert current git repo into the grov layout (bare at `.grov/repo.git`) |
-| `checkout [-b] <branch>` | Ensure worktree exists, point `workspace` at it |
-| `switch <branch>` | Just repoint `workspace` at an existing worktree |
-| `add [-b] <branch>` | Create a worktree without changing the link |
+| `checkout [-b] <branch>` | Ensure worktree exists, repoint **`workspace`** mount |
+| `switch <branch>` | Repoint **`workspace`** mount only |
+| `add [-b] <branch>` | Create a worktree without changing mounts |
 | `status` | Worktrees, stack tree, linked branch, git state |
 | `remove <branch>` | Remove a worktree (stack leaf only if branch is in a stack) |
 | `restack [--continue\|--abort]` | Rebase stacked branches onto their parents in order |
@@ -48,9 +62,13 @@ grov push                 # push subtree of stacked branches with --force-with-l
 | `base [<branch>]` | Show or set the global base (trunk) branch |
 | `stack remove <branch>` | Remove leaf from stack metadata + worktree |
 | `stack doctor` | Validate `stack.json` vs actual worktrees |
+| `mount <name> <branch>` | Add optional mount symlink at repo root |
+| `unmount <name>` | Remove optional mount (`workspace` is required) |
+| `mounts` | List all mounts |
+| `work [<target>]` | Subshell in a worktree (branch, folder, or mount name; default: workspace) |
+| `merge [<branch-a>] [<branch-b>]` | Merge branch-a into branch-b (default target: workspace branch) |
+| `exec <branch> -- <cmd...>` | Run any command in a branch worktree (no mount change) |
 | `root` / `branch` / `branches` / `path [branch]` | Introspection helpers |
-| `commit [-b <branch>] [git commit args...]` | Commit in a worktree without changing the `workspace` link |
-| `exec <branch> -- <cmd...>` | Run any command in a branch worktree (no link change) |
 | `scripts` / `run <name> [args...]` | List and run custom scripts in `.grov/scripts/` |
 
 ## Interactive TUI
@@ -68,19 +86,21 @@ your-project/
 ├── .grov/
 │   ├── repo.git/         # bare repository
 │   ├── stack.json        # stacked-branch metadata
+│   ├── mounts.json       # mount name -> worktree folder
 │   └── scripts/          # optional user scripts: grov run <name>
 ├── branches/
 │   ├── main/             # worktree
 │   ├── feature-a/
 │   └── feature-b/
-└── workspace -> branches/feature-a   # always points at active branch
+├── workspace -> branches/feature-a   # required mount (live dev)
+└── dock -> branches/feature-b        # optional mount
 ```
 
 ## Requirements
 
 - bash
 - git with worktree support
-- python3 (used for `stack.json` reads/writes and the interactive TUI)
+- python3 (used for `stack.json`, `mounts.json`, and the interactive TUI)
 
 ## License
 
