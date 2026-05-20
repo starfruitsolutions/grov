@@ -228,6 +228,52 @@ scan_worktrees_head() {
   done | sort
 }
 
+# Echo branches/<folder> basename for a git branch (works during rebase / detached HEAD).
+resolve_worktree_folder() {
+  local root=$1
+  local git_branch=$2
+  local folder head wt_path gp rb_branch
+  while IFS=$'\t' read -r folder head; do
+    [[ "$head" == "$git_branch" ]] && echo "$folder" && return 0
+  done < <(scan_worktrees_head "$root")
+  local dir="$root/$BRANCHES_DIR_NAME"
+  [[ ! -d "$dir" ]] && return 1
+  for d in "$dir"/*/; do
+    [[ -d "$d" ]] || continue
+    wt_path=$(readlink -f "$d" 2>/dev/null || echo "$d")
+    folder=$(basename "$d")
+    for sub in rebase-merge rebase-apply; do
+      gp=$(git -C "$wt_path" rev-parse --git-path "$sub" 2>/dev/null || true)
+      if [[ -n "$gp" && -d "$gp" && -f "$gp/head-name" ]]; then
+        rb_branch=$(sed 's|^refs/heads/||' <"$gp/head-name")
+        [[ "$rb_branch" == "$git_branch" ]] && echo "$folder" && return 0
+      fi
+    done
+  done
+  require_python3
+  stack_ensure_file "$root"
+  folder=$(python3 - "$root" "$git_branch" <<'PY'
+import json, os, sys
+root, br = sys.argv[1:3]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+meta = nodes.get(br) or {}
+candidates = []
+if meta.get("worktree_dir"):
+    candidates.append(meta["worktree_dir"])
+if br not in candidates:
+    candidates.append(br)
+for c in candidates:
+    if os.path.isdir(os.path.join(root, "branches", c)):
+        print(c)
+        sys.exit(0)
+sys.exit(1)
+PY
+) || true
+  [[ -n "$folder" ]] && echo "$folder" && return 0
+  return 1
+}
+
 get_primary_dir() {
   local root=$1
   cat "$root/.grov/primary-dir" 2>/dev/null || echo "master"
@@ -817,6 +863,27 @@ if os.path.isdir(branches_dir):
             h = "?"
         folder_to_head[name] = h
 
+def rebase_branch_name(wt):
+    for sub in ("rebase-merge", "rebase-apply"):
+        try:
+            gp = subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", "--git-path", sub],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            continue
+        head_name = os.path.join(gp, "head-name")
+        if os.path.isfile(head_name):
+            with open(head_name) as f:
+                ref = f.read().strip()
+            if ref.startswith("refs/heads/"):
+                return ref[len("refs/heads/"):]
+    return None
+
+folder_to_rebase = {}
+for fd, wt in folder_paths.items():
+    folder_to_rebase[fd] = rebase_branch_name(wt)
+
 with open(os.path.join(root, ".grov", "stack.json")) as f:
     nodes = (json.load(f).get("nodes") or {})
 
@@ -838,6 +905,13 @@ def find_folder(branch):
     for fd, h in folder_to_head.items():
         if h == branch:
             return fd
+    for fd, rb in folder_to_rebase.items():
+        if rb == branch:
+            return fd
+    meta = nodes.get(branch) or {}
+    for candidate in (meta.get("worktree_dir"), branch):
+        if candidate and candidate in folder_paths:
+            return candidate
     return None
 
 def children_of(name):
@@ -990,15 +1064,8 @@ find_rebase_worktrees() {
 resolve_dirs_for_branch_head() {
   local root=$1
   local git_branch=$2
-  local line dirs="" n
-  dirs=""
-  n=0
-  while IFS=$'\t' read -r folder head; do
-    [[ "$head" == "$git_branch" ]] || continue
-    dirs="$folder $dirs"
-    n=$((n + 1))
-  done < <(scan_worktrees_head "$root")
-  echo "$n $dirs"
+  local folder
+  folder=$(resolve_worktree_folder "$root" "$git_branch") && echo "1 $folder" || echo "0 "
 }
 
 materialize_worktree_if_needed() {
@@ -1077,23 +1144,22 @@ cmd_restack() {
     IFS=$'\t' read -r child parent <<<"$line"
     [[ -z "$child" ]] && continue
     materialize_worktree_if_needed "$root" "$child"
-    wt=""
-    wt=$(resolve_dirs_for_branch_head "$root" "$child")
-    wt=${wt#* }
-    wt=$(echo "$wt" | awk '{print $1}')
-    [[ -z "$wt" ]] && {
+    local wt_folder
+    wt_folder=$(resolve_worktree_folder "$root" "$child") || {
       echo "Error: Could not resolve worktree for branch $child" >&2
       exit 1
     }
-    wt_path=$(get_worktree_path "$root" "$wt")
-    wt_path=$(readlink -f "$wt_path")
+    local wt_path
+    wt_path=$(readlink -f "$(get_worktree_path "$root" "$wt_folder")")
     echo "Restack: $child onto $parent (in $wt_path)"
     if git -C "$wt_path" rebase "$parent"; then
       :
     else
+      cmd_switch "$root" "$wt_folder"
       echo "" >&2
       echo "Rebase conflict while restacking branch '$child'." >&2
       echo "Resolve in: $wt_path" >&2
+      echo "workspace -> branches/$wt_folder (linked for conflict resolution)" >&2
       echo "Then run: grov restack --continue   (or: git -C \"$wt_path\" rebase --continue)" >&2
       exit 1
     fi
