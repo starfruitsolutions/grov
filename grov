@@ -1252,6 +1252,8 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
         suffix = " " + c(DIM, f"[wt: {folder}]")
     if is_orphan and head != "?" and head != name:
         suffix = " " + c(DIM, f"[head: {head}]")
+    if base and name == base:
+        suffix += " " + c(DIM, "(base)")
     left = f"{mark}{conflict_mark}{c(DIM, prefix)}{name_disp}{suffix}"
     if folder is None or folder not in folder_paths:
         right = c(DIM, "(no worktree)")
@@ -1345,8 +1347,6 @@ else:
                 pass
         items.append(("text", f"{INDENT}{name_disp} {c(DIM, '\u2192')} {conn}{suffix}{line_extra}"))
 
-if base:
-    items.append(("text", f"{c(DIM, 'Base:  ')} {base}"))
 conflicts = branches_in_conflict()
 other_conflicts = [b for b in conflicts if b != linked_branch]
 if other_conflicts:
