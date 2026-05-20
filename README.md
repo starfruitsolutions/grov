@@ -10,7 +10,7 @@ Switching branches with `git checkout` blows away your working tree and IDE stat
 - Every branch you touch becomes a worktree under `branches/<name>/`
 - A required **`workspace`** mount points at your primary dev tree (IDE-friendly)
 - Optional **named mounts** (e.g. `dock/`) point at other worktrees without moving `workspace`
-- Stack relationships live in `.grov/stack.json` and drive `restack`, `push`, and `status`
+- Stack relationships live in `.grov/stack.json` and drive `restack`, `push`, `pull`, and `status`
 
 ## Install
 
@@ -46,13 +46,13 @@ grov push --all           # push every pushable branch (no prompt)
 - **`mount` / `unmount`** — add or remove optional symlinks; `workspace` cannot be unmounted.
 - **`work`** — ephemeral shell in a worktree; does not change any mount.
 
-## Bulk scopes (`push`, `restack`, `remove`)
+## Bulk scopes (`push`, `pull`, `restack`, `remove`)
 
 Shared targeting rules:
 
-| Invocation | `push` / `restack` | `remove` |
-|------------|-------------------|----------|
-| *(no branch)* | All pushable / all stack rebases; **prompt** | *(not allowed)* |
+| Invocation | `push` / `pull` / `restack` | `remove` |
+|------------|---------------------------|----------|
+| *(no branch)* | All pushable / all pullable / all stack rebases; **prompt** | *(not allowed)* |
 | `--all` or `--yes` | Same scope; **no prompt** | `--yes` only (no `--all`) |
 | `<branch>` | **That branch only** | **That branch only** (fails if stack children) |
 | `<branch> --cascade` | Branch + stack **descendants** (parent-before-child) | Branch + descendants (**leaves first**) |
@@ -64,6 +64,7 @@ Examples:
 ```bash
 grov push interface-improvements --cascade    # push subtree
 grov push interface-improvements              # push only that branch
+grov pull stacked-diffs..interactive-interface
 grov restack stacked-diffs..interactive-interface
 grov remove interface-improvements --cascade  # tear down subtree
 ```
@@ -82,6 +83,7 @@ grov remove interface-improvements --cascade  # tear down subtree
 | `remove [--yes] <branch>\|<a>..<b> [--cascade]` | Remove worktree(s); blocks **workspace** mount |
 | `restack [--all] [--yes] [--continue\|--abort] [[branch\|<a>..<b>] [--cascade]]` | Rebase onto parents |
 | `push [--all] [--yes] [--dry-run] [[branch\|<a>..<b>] [--cascade]]` | Push with `--force-with-lease` |
+| `pull [--all] [--yes] [--dry-run] [[branch\|<a>..<b>] [--cascade]]` | `git pull` from upstream (parent-before-child) |
 | `parent <child> [parent] [--yes] [--no-rebase]` | Add/move a branch in the stack |
 | `base [<branch>]` | Show or set the global base (trunk) branch |
 | `stack remove <branch>` | Same as `grov remove` (supports cascade/range) |

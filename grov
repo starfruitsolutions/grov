@@ -11,6 +11,7 @@
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
 #   restack [--all] [--yes] [--continue|--abort] [[<branch>|<a>..<b>] [--cascade]]   rebase onto parents (ordered)
 #   push [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]   push with --force-with-lease (default: all pushable, prompt)
+#   pull [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]   git pull upstream (default: all pullable, prompt)
 #   remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); default one branch; no --all
 #   parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (defaults parent to base)
 #   base [<branch>]         show or set the global base (trunk) branch
@@ -563,7 +564,8 @@ usage() {
   echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
   echo "  remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); no --all"
   echo "  restack [--all] [--yes] [--continue|--abort] [[branch|<a>..<b>] [--single]]"
-  echo "  push [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--single]]   (default: all pushable, prompt)"
+  echo "  push [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--cascade]]   (default: all pushable, prompt)"
+  echo "  pull [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--cascade]]   (default: all pullable, prompt)"
   echo "  parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (default parent=base)"
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
@@ -2201,6 +2203,96 @@ cmd_push() {
   done
 }
 
+cmd_pull() {
+  local root=$1
+  shift
+  stack_ensure_file "$root"
+  require_python3
+  stack_scope_parse_args "$root" "$@" || {
+    echo "Usage: grov pull [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]" >&2
+    exit 1
+  }
+
+  local yes=false dry=false
+  [[ "$SCR_YES" == true || "$SCR_ALL" == true ]] && yes=true
+  [[ "$SCR_DRY" == true ]] && dry=true
+
+  local branches_list="" header=""
+  case "$SCR_MODE" in
+    all) header="Pull all pullable branches (parent-before-child):" ;;
+    single) header="Pull '${SCR_ARG}':" ;;
+    cascade) header="Pull '${SCR_ARG}' and descendants (parent-before-child):" ;;
+    range) header="Pull chain '${SCR_FROM}..${SCR_TO}' (parent-before-child):" ;;
+  esac
+  branches_list=$(stack_scope_resolve_branches "$root") || exit 1
+  [[ "$SCR_MODE" == "range" ]] && [[ -z "$branches_list" ]] && exit 1
+
+  echo "$header"
+  local -a planned_branches=()
+  while IFS= read -r br; do
+    [[ -z "$br" ]] && continue
+    planned_branches+=("$br")
+  done <<<"$branches_list"
+
+  local -a do_branches=() do_wtpaths=()
+  local br wt_path info d ahead behind ab ab_msg
+  for br in "${planned_branches[@]}"; do
+    materialize_worktree_if_needed "$root" "$br"
+    info=$(resolve_dirs_for_branch_head "$root" "$br")
+    d=${info#* }
+    wt_path=$(readlink -f "$(get_worktree_path "$root" "${d%% *}")" 2>/dev/null || get_worktree_path "$root" "${d%% *}")
+    if worktree_in_rebase "$wt_path"; then
+      echo "  $br: rebase in progress (skip pull)"
+      continue
+    fi
+    if ! push_resolve_upstream "$wt_path" "$br" &>/dev/null; then
+      echo "  $br: no upstream"
+      continue
+    fi
+    ab=$(push_ahead_behind "$wt_path" "$br")
+    ahead=${ab%% *}
+    behind=${ab#* }
+    if [[ "$behind" == "0" ]]; then
+      if [[ "$ahead" == "0" ]]; then
+        echo "  $br: up to date"
+      else
+        echo "  $br: ahead $ahead (nothing to pull)"
+      fi
+      continue
+    fi
+    ab_msg="behind $behind"
+    [[ "$ahead" != "0" ]] && ab_msg="ahead $ahead, $ab_msg"
+    echo "  $br: $ab_msg"
+    do_branches+=("$br")
+    do_wtpaths+=("$wt_path")
+  done
+
+  local n=${#do_branches[@]}
+  [[ "$n" -eq 0 ]] && return 0
+
+  if [[ "$dry" == true ]]; then
+    local i
+    for ((i = 0; i < n; i++)); do
+      echo "    dry-run: git -C \"${do_wtpaths[$i]}\" pull"
+    done
+    return 0
+  fi
+
+  if [[ "$yes" != true ]]; then
+    echo -n "Pull $n branch(es)? [y/N] "
+    read -r ans </dev/tty
+    [[ "$ans" != [yY]* ]] && return 0
+  fi
+
+  local i
+  for ((i = 0; i < n; i++)); do
+    br="${do_branches[$i]}"
+    wt_path="${do_wtpaths[$i]}"
+    echo "  $br: pulling"
+    git -C "$wt_path" pull || exit 1
+  done
+}
+
 cmd_parent() {
   local root=$1
   shift
@@ -2461,6 +2553,7 @@ case "$cmd" in
   remove)     cmd_remove "$GROV_ROOT" "$@" ;;
   restack)    cmd_restack "$GROV_ROOT" "$@" ;;
   push)       cmd_push "$GROV_ROOT" "$@" ;;
+  pull)       cmd_pull "$GROV_ROOT" "$@" ;;
   mount)      cmd_mount "$GROV_ROOT" "$@" ;;
   unmount)    cmd_unmount "$GROV_ROOT" "$@" ;;
   mounts)     cmd_mounts "$GROV_ROOT" ;;

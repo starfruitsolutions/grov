@@ -115,7 +115,7 @@ _grov_complete_stack_scope() {
   [[ -z "$has_yes" ]] && opts+="--yes "
   [[ -z "$has_all" && "$cmd_name" != "remove" ]] && opts+="--all "
   [[ -z "$has_cascade" ]] && opts+="--cascade "
-  [[ -z "$has_dry" && "$cmd_name" == "push" ]] && opts+="--dry-run "
+  [[ -z "$has_dry" && ( "$cmd_name" == "push" || "$cmd_name" == "pull" ) ]] && opts+="--dry-run "
 
   if [[ "$cur" == -* ]]; then
     COMPREPLY=($(compgen -W "${opts%" "}" -- "$cur"))
@@ -148,7 +148,7 @@ _grov_complete_push() {
 _grov() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
-  local commands="init restore checkout switch add status remove restack push mount unmount mounts work merge exec parent base stack interactive root branch branches path scripts run"
+  local commands="init restore checkout switch add status remove restack push pull mount unmount mounts work merge exec parent base stack interactive root branch branches path scripts run"
   if [[ $cword -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     return
@@ -187,7 +187,7 @@ _grov() {
         _grov_complete_stack_scope
       fi
       ;;
-    push)
+    push|pull)
       compopt +o default 2>/dev/null
       _grov_complete_push
       ;;
