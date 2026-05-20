@@ -30,7 +30,7 @@ grov init                 # convert existing repo into the grov layout
 grov checkout -b feature  # create branch, worktree, point workspace at it
 cd workspace              # primary dev tree
 # ...edit, git add, git commit...
-grov push                 # push subtree of stacked branches with --force-with-lease
+grov push --all           # push every pushable branch (no prompt)
 ```
 
 ## Mounts vs work vs checkout
@@ -46,6 +46,30 @@ grov push                 # push subtree of stacked branches with --force-with-l
 - **`mount` / `unmount`** — add or remove optional symlinks; `workspace` cannot be unmounted.
 - **`work`** — ephemeral shell in a worktree; does not change any mount.
 
+## Bulk scopes (`push`, `restack`, `remove`)
+
+Shared targeting rules:
+
+| Invocation | `push` / `restack` | `remove` |
+|------------|-------------------|----------|
+| *(no branch)* | All pushable / all stack rebases; **prompt** | *(not allowed)* |
+| `--all` or `--yes` | Same scope; **no prompt** | `--yes` only (no `--all`) |
+| `<branch>` | **That branch only** | **That branch only** (fails if stack children) |
+| `<branch> --cascade` | Branch + stack **descendants** (parent-before-child) | Branch + descendants (**leaves first**) |
+| `<from>..<to>` | Stack chain (from exclusive → to inclusive) | Same chain (**leaves first**) |
+| `--cascade` *(no branch)* | Descendants from **workspace** mount branch | — |
+
+Examples:
+
+```bash
+grov push interface-improvements --cascade    # push subtree
+grov push interface-improvements              # push only that branch
+grov restack stacked-diffs..interactive-interface
+grov remove interface-improvements --cascade  # tear down subtree
+```
+
+`--continue` / `--abort` on `restack` apply to an in-progress rebase only.
+
 ## Commands
 
 | Command | What it does |
@@ -54,19 +78,19 @@ grov push                 # push subtree of stacked branches with --force-with-l
 | `checkout [-b] <branch>` | Ensure worktree exists, repoint **`workspace`** mount |
 | `switch <branch>` | Repoint **`workspace`** mount only |
 | `add [-b] <branch>` | Create a worktree without changing mounts |
-| `status` | Worktrees, stack tree, linked branch, git state |
-| `remove <branch>` | Remove a worktree (stack leaf only if branch is in a stack) |
-| `restack [--continue\|--abort]` | Rebase stacked branches onto their parents in order |
-| `push [--yes] [--dry-run] [--from <b>]` | Push linked branch subtree with `--force-with-lease` |
+| `status` | Worktrees, stack tree, mounts, git state |
+| `remove [--yes] <branch>\|<a>..<b> [--cascade]` | Remove worktree(s); blocks **workspace** mount |
+| `restack [--all] [--yes] [--continue\|--abort] [[branch\|<a>..<b>] [--cascade]]` | Rebase onto parents |
+| `push [--all] [--yes] [--dry-run] [[branch\|<a>..<b>] [--cascade]]` | Push with `--force-with-lease` |
 | `parent <child> [parent] [--yes] [--no-rebase]` | Add/move a branch in the stack |
 | `base [<branch>]` | Show or set the global base (trunk) branch |
-| `stack remove <branch>` | Remove leaf from stack metadata + worktree |
+| `stack remove <branch>` | Same as `grov remove` (supports cascade/range) |
 | `stack doctor` | Validate `stack.json` vs actual worktrees |
 | `mount <name> <branch>` | Add optional mount symlink at repo root |
 | `unmount <name>` | Remove optional mount (`workspace` is required) |
 | `mounts` | List all mounts |
-| `work [<target>]` | Subshell in a worktree (branch, folder, or mount name; default: workspace) |
-| `merge [<branch-a>] [<branch-b>]` | Merge branch-a into branch-b (default target: workspace branch) |
+| `work [<target>]` | Subshell in a worktree (branch, folder, or mount name) |
+| `merge [<branch-a>] [<branch-b>]` | Merge branch-a into branch-b (default target: workspace) |
 | `exec <branch> -- <cmd...>` | Run any command in a branch worktree (no mount change) |
 | `root` / `branch` / `branches` / `path [branch]` | Introspection helpers |
 | `scripts` / `run <name> [args...]` | List and run custom scripts in `.grov/scripts/` |
@@ -77,7 +101,7 @@ grov push                 # push subtree of stacked branches with --force-with-l
 grov interactive          # or: grov-interactive
 ```
 
-A curses dashboard showing all worktrees, the stack tree, dirty/ahead/behind state, and the linked branch. All mutations shell out to `grov` so behavior stays identical to the CLI.
+A curses dashboard showing all worktrees, the stack tree, dirty/ahead/behind state, and mounts. All mutations shell out to `grov` so behavior stays identical to the CLI.
 
 ## Layout
 

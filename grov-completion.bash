@@ -93,26 +93,19 @@ _grov_list_scripts() {
   done | sort
 }
 
-_grov_complete_push() {
+_grov_complete_stack_scope() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
 
-  if [[ "$prev" == "--from" ]]; then
-    COMPREPLY=($(compgen -W "$(_grov_list_git_branches)" -- "$cur"))
-    return
-  fi
-
-  local i has_yes= has_dry= has_subtree= has_from= has_positional=
+  local i has_yes= has_all= has_cascade= has_dry= has_positional=
+  local cmd_name="${words[1]}"
   for ((i = 2; i < cword; i++)); do
     case "${words[i]}" in
       --yes) has_yes=1 ;;
+      --all) has_all=1 ;;
+      --cascade) has_cascade=1 ;;
       --dry-run) has_dry=1 ;;
-      --subtree) has_subtree=1 ;;
-      --from)
-        has_from=1
-        has_subtree=1
-        if ((i + 1 < cword)); then ((i++)); fi
-        ;;
+      --continue|--abort) ;;
       --*) ;;
       *) has_positional=1 ;;
     esac
@@ -120,18 +113,12 @@ _grov_complete_push() {
 
   local opts=""
   [[ -z "$has_yes" ]] && opts+="--yes "
-  [[ -z "$has_dry" ]] && opts+="--dry-run "
-  if [[ -z "$has_positional" && -z "$has_subtree" ]]; then
-    opts+="--subtree --from "
-  fi
+  [[ -z "$has_all" && "$cmd_name" != "remove" ]] && opts+="--all "
+  [[ -z "$has_cascade" ]] && opts+="--cascade "
+  [[ -z "$has_dry" && "$cmd_name" == "push" ]] && opts+="--dry-run "
 
   if [[ "$cur" == -* ]]; then
     COMPREPLY=($(compgen -W "${opts%" "}" -- "$cur"))
-    return
-  fi
-
-  if [[ -n "$has_subtree" || -n "$has_from" ]]; then
-    [[ -n "$opts" ]] && COMPREPLY=($(compgen -W "${opts%" "}" -- "$cur"))
     return
   fi
 
@@ -147,10 +134,15 @@ _grov_complete_push() {
     else
       COMPREPLY=($(compgen -W "$branches" -- "$cur"))
     fi
+    [[ -n "$opts" ]] && COMPREPLY+=($(compgen -W "${opts%" "}" -- "$cur"))
     return
   fi
 
   [[ -n "$opts" ]] && COMPREPLY=($(compgen -W "${opts%" "}" -- "$cur"))
+}
+
+_grov_complete_push() {
+  _grov_complete_stack_scope
 }
 
 _grov() {
@@ -189,7 +181,11 @@ _grov() {
       ;;
     status) ;;
     restack)
-      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "--continue --abort" -- "$cur"))
+      if [[ $cword -eq 2 && "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "--continue --abort --all --yes --cascade" -- "$cur"))
+      else
+        _grov_complete_stack_scope
+      fi
       ;;
     push)
       compopt +o default 2>/dev/null
@@ -244,7 +240,11 @@ _grov() {
       [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_scripts)" -- "$cur"))
       ;;
     remove)
-      [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(_grov_list_branches)" -- "$cur"))
+      if [[ $cword -eq 2 && "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "--yes --cascade" -- "$cur"))
+      else
+        _grov_complete_stack_scope
+      fi
       ;;
     root) ;;
     branch) ;;

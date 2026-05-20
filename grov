@@ -9,8 +9,9 @@
 #   add [-b] <branch>       create worktree only (no link change)
 #   status [--no-fetch]     list worktrees, stack tree, linked branch, git state (fetches by default)
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
-#   restack [--continue|--abort]   rebase stacked branches onto parents (ordered)
-#   push [<branch>|<a>..<b>] [--subtree [<from>]] [--yes] [--dry-run]   push branches with --force-with-lease (default: linked branch)
+#   restack [--all] [--yes] [--continue|--abort] [[<branch>|<a>..<b>] [--cascade]]   rebase onto parents (ordered)
+#   push [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]   push with --force-with-lease (default: all pushable, prompt)
+#   remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); default one branch; no --all
 #   parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (defaults parent to base)
 #   base [<branch>]         show or set the global base (trunk) branch
 #   stack remove <branch>   remove leaf from stack metadata + worktree
@@ -560,9 +561,9 @@ usage() {
   echo "  switch <branch>          point workspace at existing worktree only"
   echo "  add [-b] <branch>        create worktree only (no link change)"
   echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
-  echo "  remove <branch>          remove worktree (stack branch must be a leaf)"
-  echo "  restack [--continue|--abort]   rebase stacked branches (parent order)"
-  echo "  push [<branch>|<a>..<b>] [--subtree [<f>]] [--yes] [--dry-run]   push branches (default: linked)"
+  echo "  remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); no --all"
+  echo "  restack [--all] [--yes] [--continue|--abort] [[branch|<a>..<b>] [--single]]"
+  echo "  push [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--single]]   (default: all pushable, prompt)"
   echo "  parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (default parent=base)"
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
@@ -833,55 +834,138 @@ cmd_run() {
   exec "$script_path" "$@"
 }
 
-cmd_remove() {
+remove_has_stack_children() {
   local root=$1
-  shift
-  local branch="$1"
-  [[ -z "$branch" ]] && echo "Usage: grov remove <branch>" >&2 && exit 1
+  local branch=$2
   stack_ensure_file "$root"
-  local stack_file
-  stack_file=$(stack_path "$root")
-  if [[ -f "$stack_file" ]]; then
-    set +e
-    python3 - "$root" "$branch" <<'PY'
+  python3 - "$root" "$branch" <<'PY'
 import json, sys
 root, br = sys.argv[1:3]
 with open(f"{root}/.grov/stack.json") as f:
-    d = json.load(f)
-nodes = d.get("nodes") or {}
+    nodes = json.load(f).get("nodes") or {}
 if br in nodes:
     for _, meta in nodes.items():
         if meta.get("parent") == br:
             sys.exit(2)
 sys.exit(0)
 PY
-    rc=$?
+}
+
+unmount_symlinks_for_folder() {
+  local root=$1
+  local folder=$2
+  local mname mfolder link_path
+  mounts_ensure_file "$root" 2>/dev/null || return 0
+  while IFS= read -r mname; do
+    [[ -z "$mname" || "$mname" == "$WORKSPACE_MOUNT" ]] && continue
+    mfolder=$(mounts_get_folder "$root" "$mname")
+    [[ "$mfolder" != "$folder" ]] && continue
+    mounts_remove_name "$root" "$mname"
+    link_path=$(cd "$root" && pwd)/$mname
+    [[ -L "$link_path" || -e "$link_path" ]] && rm -f "$link_path"
+    echo "Unmounted $mname"
+  done < <(mounts_list_names "$root" 2>/dev/null || true)
+}
+
+remove_one_branch() {
+  local root=$1
+  local branch=$2
+  local check_children=$3
+  local folder wt_path ws_folder
+  folder=$(resolve_target_folder "$root" "$branch") || {
+    echo "Error: Could not resolve '$branch'." >&2
+    return 1
+  }
+  ws_folder=$(get_linked_branch "$root" 2>/dev/null) || true
+  if [[ -n "$ws_folder" && "$folder" == "$ws_folder" ]]; then
+    echo "Error: Cannot remove '$branch' (workspace mount). Switch workspace first." >&2
+    return 1
+  fi
+  if [[ "$check_children" == true ]]; then
+    set +e
+    remove_has_stack_children "$root" "$branch"
+    local rc=$?
     set -e
     if [[ "$rc" -eq 2 ]]; then
-      echo "Error: Branch '$branch' has stacked children. Reparent (grov parent) or remove children first (see grov status)." >&2
-      exit 1
+      echo "Error: Branch '$branch' has stacked children. Use --cascade or remove children first." >&2
+      return 1
     fi
-    [[ "$rc" -ne 0 ]] && exit "$rc"
+    [[ "$rc" -ne 0 ]] && return "$rc"
   fi
-  local wt_path
-  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
+  wt_path=$(get_worktree_path "$root" "$folder")
+  wt_path=$(readlink -f "$wt_path" 2>/dev/null || echo "$wt_path")
   if [[ ! -d "$wt_path" ]]; then
     echo "Error: No worktree at $wt_path" >&2
-    exit 1
+    return 1
   fi
   if has_bare "$root"; then
     git --git-dir="$root/$BARE_REPO" worktree remove "$wt_path"
   else
     local primary_dir
     primary_dir=$(get_primary_dir "$root")
-    if [[ "$branch" == "$primary_dir" ]]; then
+    if [[ "$folder" == "$primary_dir" ]]; then
       echo "Error: Cannot remove the primary worktree ($primary_dir)." >&2
-      exit 1
+      return 1
     fi
     git -C "$root/$BRANCHES_DIR_NAME/$primary_dir" worktree remove "$wt_path"
   fi
   stack_remove_node "$root" "$branch" 2>/dev/null || true
-  echo "Removed worktree: $branch"
+  unmount_symlinks_for_folder "$root" "$folder"
+  echo "Removed worktree: $folder ($branch)"
+}
+
+cmd_remove() {
+  local root=$1
+  shift
+  stack_ensure_file "$root"
+  require_python3
+  stack_scope_parse_args "$root" "$@" || {
+    echo "Usage: grov remove [--yes] <branch>|<a>..<b> [--cascade]" >&2
+    exit 1
+  }
+  [[ "$SCR_ALL" == true ]] && {
+    echo "Error: grov remove does not support --all." >&2
+    exit 1
+  }
+  [[ "$SCR_MODE" == "all" ]] && {
+    echo "Usage: grov remove [--yes] <branch>|<a>..<b> [--cascade]" >&2
+    exit 1
+  }
+  [[ "$SCR_DRY" == true ]] && {
+    echo "Error: grov remove does not support --dry-run." >&2
+    exit 1
+  }
+
+  local header="" branches_list
+  case "$SCR_MODE" in
+    single) header="Remove '${SCR_ARG}':" ;;
+    cascade) header="Remove '${SCR_ARG}' and descendants (leaves first):" ;;
+    range) header="Remove chain '${SCR_FROM}..${SCR_TO}' (leaves first):" ;;
+  esac
+  branches_list=$(stack_scope_resolve_branches_remove_order "$root") || exit 1
+  [[ -z "$branches_list" ]] && { echo "Nothing to remove."; return 0; }
+
+  echo "$header"
+  local br
+  while IFS= read -r br; do
+    [[ -z "$br" ]] && continue
+    echo "  $br"
+  done <<<"$branches_list"
+
+  if [[ "$SCR_YES" != true ]]; then
+    local n
+    n=$(grep -c . <<<"$branches_list" || echo 0)
+    echo -n "Remove $n worktree(s)? [y/N] "
+    read -r ans </dev/tty
+    [[ "$ans" != [yY]* ]] && return 0
+  fi
+
+  local check_children=true
+  [[ "$SCR_MODE" != "single" ]] && check_children=false
+  while IFS= read -r br; do
+    [[ -z "$br" ]] && continue
+    remove_one_branch "$root" "$br" "$check_children"
+  done <<<"$branches_list"
 }
 
 git_state_line() {
@@ -1436,45 +1520,6 @@ materialize_worktree_if_needed() {
   ensure_worktree "$root" false "$branch"
 }
 
-restack_order_and_rebase() {
-  local root=$1
-  require_python3
-  stack_ensure_file "$root"
-  python3 - "$root" <<'PY'
-import json, os, subprocess, sys
-
-root = sys.argv[1]
-with open(os.path.join(root, ".grov", "stack.json")) as f:
-    nodes = json.load(f).get("nodes") or {}
-if not nodes:
-    print("Nothing in stack.", file=sys.stderr)
-    sys.exit(0)
-
-names = list(nodes.keys())
-
-def depth(b):
-    if b not in nodes:
-        return 0
-    d, cur, seen = 0, b, set()
-    while cur in nodes and cur not in seen:
-        seen.add(cur)
-        p = nodes[cur].get("parent")
-        if not p or p not in nodes:
-            break
-        d += 1
-        cur = p
-    return d
-
-ordered = sorted(names, key=lambda b: (depth(b), b))
-for b in ordered:
-    meta = nodes[b]
-    par = meta.get("parent")
-    if not par:
-        continue
-    print(f"{b}\t{par}")
-PY
-}
-
 cmd_restack() {
   local root=$1
   shift
@@ -1486,14 +1531,41 @@ cmd_restack() {
     cmd_restack_abort "$root"
     return
   fi
-  [[ $# -gt 0 ]] && echo "Usage: grov restack [--continue|--abort]" >&2 && exit 1
+  stack_ensure_file "$root"
+  require_python3
+  stack_scope_parse_args "$root" "$@" || {
+    echo "Usage: grov restack [--all] [--yes] [--continue|--abort] [[<branch>|<a>..<b>] [--cascade]]" >&2
+    exit 1
+  }
 
-  local line child parent wt mapfile_order
-  mapfile -t mapfile_order < <(restack_order_and_rebase "$root")
+  local header="" branches_filter="" mapfile_order
+  case "$SCR_MODE" in
+    all) header="Restack all stacked branches (parent order):" ;;
+    single) header="Restack '${SCR_ARG}':" ;;
+    cascade) header="Restack '${SCR_ARG}' and descendants (parent order):" ;;
+    range) header="Restack chain '${SCR_FROM}..${SCR_TO}' (parent order):" ;;
+  esac
+
+  branches_filter=$(stack_scope_resolve_branches "$root")
+  mapfile -t mapfile_order < <(collect_restack_pairs "$root" "$branches_filter")
   if [[ ${#mapfile_order[@]} -eq 0 ]]; then
     echo "Nothing to restack."
     return 0
   fi
+
+  echo "$header"
+  local line child parent
+  for line in "${mapfile_order[@]}"; do
+    IFS=$'\t' read -r child parent <<<"$line"
+    echo "  $child onto $parent"
+  done
+
+  if [[ "$SCR_YES" != true && "$SCR_ALL" != true ]]; then
+    echo -n "Restack ${#mapfile_order[@]} branch(es)? [y/N] "
+    read -r ans </dev/tty
+    [[ "$ans" != [yY]* ]] && return 0
+  fi
+
   for line in "${mapfile_order[@]}"; do
     IFS=$'\t' read -r child parent <<<"$line"
     [[ -z "$child" ]] && continue
@@ -1629,6 +1701,204 @@ while cur != frm:
 for b in reversed(chain):
     print(b)
 PY
+}
+
+# All stack nodes (depth order) plus worktree HEAD branches not already listed.
+collect_all_branches() {
+  local root=$1
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$BRANCHES_DIR_NAME" <<'PY'
+import json, os, subprocess, sys
+
+root, branches_dir = sys.argv[1:3]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+
+def depth(b):
+    if b not in nodes:
+        return 0
+    d, cur, seen = 0, b, set()
+    while cur in nodes and cur not in seen:
+        seen.add(cur)
+        p = nodes[cur].get("parent")
+        if not p or p not in nodes:
+            break
+        d += 1
+        cur = p
+    return d
+
+seen = set()
+out = []
+for b in sorted(nodes.keys(), key=lambda x: (depth(x), x)):
+    if b not in seen:
+        seen.add(b)
+        out.append(b)
+
+bd = os.path.join(root, branches_dir)
+if os.path.isdir(bd):
+    for folder in sorted(os.listdir(bd)):
+        p = os.path.join(bd, folder)
+        if not os.path.isdir(p):
+            continue
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", p, "rev-parse", "--abbrev-ref", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip()
+        except subprocess.CalledProcessError:
+            head = folder
+        if head and head != "HEAD" and head not in seen:
+            seen.add(head)
+            out.append(head)
+        elif folder not in seen and folder not in out:
+            seen.add(folder)
+            out.append(folder)
+
+for b in out:
+    print(b)
+PY
+}
+
+# child<TAB>parent lines for restack; optional second arg is newline-separated branch filter.
+collect_restack_pairs() {
+  local root=$1
+  local filter_list="${2:-}"
+  require_python3
+  stack_ensure_file "$root"
+  python3 - "$root" "$filter_list" <<'PY'
+import json, os, sys
+
+root = sys.argv[1]
+raw = sys.argv[2] if len(sys.argv) > 2 else ""
+filters = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+allow = set(filters) if filters else None
+
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+
+def depth(b):
+    if b not in nodes:
+        return 0
+    d, cur, seen = 0, b, set()
+    while cur in nodes and cur not in seen:
+        seen.add(cur)
+        p = nodes[cur].get("parent")
+        if not p or p not in nodes:
+            break
+        d += 1
+        cur = p
+    return d
+
+ordered = sorted(nodes.keys(), key=lambda b: (depth(b), b))
+for child in ordered:
+    if allow is not None and child not in allow:
+        continue
+    par = nodes[child].get("parent")
+    if not par:
+        continue
+    print(f"{child}\t{par}")
+PY
+}
+
+# Sets: SCR_YES SCR_ALL SCR_CASCADE SCR_DRY SCR_MODE SCR_ARG SCR_FROM SCR_TO
+# SCR_MODE: all | single | cascade | range
+stack_scope_default_branch() {
+  local root=$1
+  get_linked_git_branch "$root" 2>/dev/null || get_linked_branch "$root" 2>/dev/null || true
+}
+
+# Optional: pass root as $1 for --cascade default branch. Rejects --single (removed).
+stack_scope_parse_args() {
+  local root="${1:-}"
+  [[ -n "$root" && "$root" != --* ]] && shift || root=""
+  SCR_YES=false
+  SCR_ALL=false
+  SCR_CASCADE=false
+  SCR_DRY=false
+  SCR_MODE=""
+  SCR_ARG=""
+  SCR_FROM=""
+  SCR_TO=""
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) SCR_YES=true ;;
+      --all) SCR_ALL=true ;;
+      --cascade) SCR_CASCADE=true ;;
+      --single) echo "Error: --single was removed; use a branch alone for one target, or --cascade for descendants." >&2; return 1 ;;
+      --dry-run) SCR_DRY=true ;;
+      -*) echo "Unknown option: $1" >&2; return 1 ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  if [[ ${#positional[@]} -gt 1 ]]; then
+    echo "Error: too many positional arguments." >&2
+    return 1
+  fi
+  if [[ ${#positional[@]} -eq 1 ]]; then
+    SCR_ARG="${positional[0]}"
+    if [[ "$SCR_ARG" == *..*..* ]]; then
+      echo "Error: invalid range syntax '$SCR_ARG' (expected <a>..<b>)." >&2
+      return 1
+    fi
+    if [[ "$SCR_ARG" == *..* ]]; then
+      [[ "$SCR_CASCADE" == true ]] && {
+        echo "Error: --cascade cannot be used with a range (a..b)." >&2
+        return 1
+      }
+      SCR_MODE="range"
+      SCR_FROM="${SCR_ARG%%..*}"
+      SCR_TO="${SCR_ARG##*..}"
+      [[ -z "$SCR_FROM" || -z "$SCR_TO" ]] && {
+        echo "Error: invalid range '$SCR_ARG'." >&2
+        return 1
+      }
+    elif [[ "$SCR_CASCADE" == true ]]; then
+      SCR_MODE="cascade"
+    else
+      SCR_MODE="single"
+    fi
+  elif [[ "$SCR_CASCADE" == true ]]; then
+    [[ -z "$root" ]] && {
+      echo "Error: --cascade without a branch requires a grov project root." >&2
+      return 1
+    }
+    SCR_ARG=$(stack_scope_default_branch "$root")
+    [[ -z "$SCR_ARG" ]] && {
+      echo "Error: --cascade requires a branch (no workspace mount)." >&2
+      return 1
+    }
+    SCR_MODE="cascade"
+  else
+    SCR_MODE="all"
+  fi
+  return 0
+}
+
+# Echo branch list (one per line). Uses SCR_* from stack_scope_parse_args.
+stack_scope_resolve_branches() {
+  local root=$1
+  case "$SCR_MODE" in
+    all) collect_all_branches "$root" ;;
+    single) echo "$SCR_ARG" ;;
+    cascade) collect_subtree_branches "$root" "$SCR_ARG" ;;
+    range) collect_stack_range "$root" "$SCR_FROM" "$SCR_TO" ;;
+  esac
+}
+
+# Leaves-first order for remove (reverse parent-before-child list).
+stack_scope_resolve_branches_remove_order() {
+  local root=$1
+  local lines
+  lines=$(stack_scope_resolve_branches "$root")
+  [[ -z "$lines" ]] && return 0
+  if [[ "$SCR_MODE" == "single" ]]; then
+    echo "$lines"
+    return 0
+  fi
+  tac <<<"$lines" 2>/dev/null || tail -r <<<"$lines"
 }
 
 worktree_in_rebase() {
@@ -1825,64 +2095,26 @@ cmd_exec() {
 cmd_push() {
   local root=$1
   shift
-  local yes=false dry=false
-  local subtree=false
-  local subtree_from=""
-  local positional=()
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --yes) yes=true ;;
-      --dry-run) dry=true ;;
-      --subtree) subtree=true ;;
-      --from)
-        shift
-        subtree=true
-        subtree_from="${1:-}"
-        [[ -z "$subtree_from" ]] && echo "Usage: grov push --from <branch>" >&2 && exit 1
-        ;;
-      -*) echo "Unknown option: $1" >&2; exit 1 ;;
-      *) positional+=("$1") ;;
-    esac
-    shift
-  done
   stack_ensure_file "$root"
   require_python3
-
-  if [[ "$subtree" == true && ${#positional[@]} -gt 0 ]]; then
-    echo "Error: cannot combine --subtree/--from with a positional branch argument." >&2
+  stack_scope_parse_args "$root" "$@" || {
+    echo "Usage: grov push [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]" >&2
     exit 1
-  fi
+  }
+
+  local yes=false dry=false
+  [[ "$SCR_YES" == true || "$SCR_ALL" == true ]] && yes=true
+  [[ "$SCR_DRY" == true ]] && dry=true
 
   local branches_list="" header=""
-  if [[ "$subtree" == true ]]; then
-    local start="$subtree_from"
-    [[ -z "$start" ]] && start=$(get_linked_git_branch "$root" 2>/dev/null || true)
-    [[ -z "$start" ]] && start=$(get_linked_branch "$root" 2>/dev/null || true)
-    [[ -z "$start" ]] && { echo "Error: No linked branch; pass --from <branch>." >&2; exit 1; }
-    branches_list=$(collect_subtree_branches "$root" "$start")
-    header="Push subtree from '$start' (ordered parent-before-child):"
-  elif [[ ${#positional[@]} -eq 0 ]]; then
-    local cur
-    cur=$(get_linked_git_branch "$root" 2>/dev/null || true)
-    [[ -z "$cur" ]] && cur=$(get_linked_branch "$root" 2>/dev/null || true)
-    [[ -z "$cur" ]] && { echo "Error: No linked branch." >&2; exit 1; }
-    branches_list="$cur"
-    header="Push '$cur':"
-  elif [[ ${#positional[@]} -eq 1 && "${positional[0]}" == *..* ]]; then
-    local arg="${positional[0]}"
-    [[ "$arg" == *..*..* ]] && { echo "Error: invalid range syntax '$arg' (expected <a>..<b>)." >&2; exit 1; }
-    local from_b="${arg%%..*}"
-    local to_b="${arg##*..}"
-    [[ -z "$from_b" || -z "$to_b" ]] && { echo "Usage: grov push <a>..<b>" >&2; exit 1; }
-    branches_list=$(collect_stack_range "$root" "$from_b" "$to_b") || exit 1
-    header="Push chain '$from_b..$to_b' (ordered parent-before-child):"
-  elif [[ ${#positional[@]} -eq 1 ]]; then
-    branches_list="${positional[0]}"
-    header="Push '${positional[0]}':"
-  else
-    echo "Usage: grov push [<branch>|<a>..<b>] [--subtree [<from>] | --from <from>] [--yes] [--dry-run]" >&2
-    exit 1
-  fi
+  case "$SCR_MODE" in
+    all) header="Push all pushable branches (parent-before-child):" ;;
+    single) header="Push '${SCR_ARG}':" ;;
+    cascade) header="Push '${SCR_ARG}' and descendants (parent-before-child):" ;;
+    range) header="Push chain '${SCR_FROM}..${SCR_TO}' (parent-before-child):" ;;
+  esac
+  branches_list=$(stack_scope_resolve_branches "$root") || exit 1
+  [[ "$SCR_MODE" == "range" ]] && [[ -z "$branches_list" ]] && exit 1
 
   echo "$header"
   local -a planned_branches=()
@@ -1943,19 +2175,10 @@ cmd_push() {
     return 0
   fi
 
-  local batch_confirm=false
-  [[ ${#planned_branches[@]} -gt 1 ]] && batch_confirm=true
-
   if [[ "$yes" != true ]]; then
-    if [[ "$batch_confirm" == true ]]; then
-      echo -n "Push $n branch(es)? [y/N] "
-      read -r ans </dev/tty
-      [[ "$ans" != [yY]* ]] && return 0
-    else
-      echo -n "Push ${do_branches[0]}? [y/N] "
-      read -r ans </dev/tty
-      [[ "$ans" != [yY]* ]] && return 0
-    fi
+    echo -n "Push $n branch(es)? [y/N] "
+    read -r ans </dev/tty
+    [[ "$ans" != [yY]* ]] && return 0
   fi
 
   local i remote push_branch upstream_input
@@ -1965,7 +2188,7 @@ cmd_push() {
     if [[ "${do_kinds[$i]}" == "setup" ]]; then
       remote="${do_remotes[$i]}"
       push_branch="${do_push_names[$i]}"
-      if [[ "$yes" != true && "$batch_confirm" != true ]]; then
+      if [[ "$yes" != true ]]; then
         echo -n "  $br: set upstream to [$remote/$push_branch]? [y/N] "
         read -r upstream_input </dev/tty
         [[ "$upstream_input" != [yY]* ]] && continue
