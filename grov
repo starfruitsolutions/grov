@@ -940,11 +940,9 @@ cmd_status() {
       git -C "$root/$BRANCHES_DIR_NAME/$primary_dir" fetch --all --quiet 2>/dev/null || true
     fi
   fi
-  local link_path="$root/$LINK_NAME"
   local linked=""
-  if [[ -L "$link_path" ]]; then
-    linked=$(basename "$(readlink "$link_path")")
-  fi
+  linked=$(get_linked_branch "$root" 2>/dev/null) || true
+  [[ -z "$linked" && -L "$root/$LINK_NAME" ]] && linked=$(basename "$(readlink "$root/$LINK_NAME")")
   local base
   base=$(stack_get_base "$root" 2>/dev/null) || true
   if [[ -z "$base" ]]; then
@@ -1299,18 +1297,41 @@ def branch_name_for_linked_folder(folder):
     return folder
 
 linked_branch = branch_name_for_linked_folder(linked)
-linked_disp = c(BOLD, linked_branch or linked) if linked else c(DIM, "(none)")
-linked_extra = ""
-conflicts = branches_in_conflict()
-if linked_branch and linked_branch in conflicts and linked in folder_paths:
-    try:
-        _, st = get_state(folder_paths[linked])
-        linked_extra = " " + c(ORANGE, st)
-    except Exception:
-        linked_extra = " " + c(ORANGE, "conflict")
-items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}{linked_extra}"))
+
+mounts_path = os.path.join(root, ".grov", "mounts.json")
+mounts = {}
+if os.path.isfile(mounts_path):
+    with open(mounts_path) as f:
+        mounts = json.load(f).get("mounts") or {}
+if not mounts and linked:
+    mounts = {"workspace": linked}
+
+items.append(("section", "Mounts"))
+if not mounts:
+    items.append(("dim", f"{INDENT}(none)"))
+else:
+    for mname in sorted(mounts.keys()):
+        folder = mounts[mname] or ""
+        head = folder_to_head.get(folder, "?") if folder else "?"
+        target = head if head and head != "?" else (folder or "?")
+        suffix = ""
+        if folder and folder != target:
+            suffix = " " + c(DIM, f"[wt: {folder}]")
+        name_disp = c(BOLD, mname) if mname == "workspace" else mname
+        conn = c(BOLD, target) if mname == "workspace" else target
+        line_extra = ""
+        if folder and folder in folder_paths:
+            try:
+                sc, st = get_state(folder_paths[folder])
+                if sc == "conflict":
+                    line_extra = " " + c(ORANGE, st)
+            except Exception:
+                pass
+        items.append(("text", f"{INDENT}{name_disp} {c(DIM, '\u2192')} {conn}{suffix}{line_extra}"))
+
 if base:
     items.append(("text", f"{c(DIM, 'Base:  ')} {base}"))
+conflicts = branches_in_conflict()
 other_conflicts = [b for b in conflicts if b != linked_branch]
 if other_conflicts:
     items.append(("text", f"{c(DIM, 'Conflict:')} {c(ORANGE, ', '.join(other_conflicts))}"))
