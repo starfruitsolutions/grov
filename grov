@@ -944,21 +944,66 @@ def children_of(name):
 
 items = []
 
-def get_remote_diff(wt):
+def resolve_upstream(wt, branch_hint=None):
+    """Return (local_ref, upstream_ref) for ahead/behind; works during rebase/detached HEAD."""
+    if not branch_hint:
+        branch_hint = rebase_branch_name(wt)
+    if not branch_hint:
+        try:
+            h = subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            if h and h != "HEAD":
+                branch_hint = h
+        except subprocess.CalledProcessError:
+            pass
+    if branch_hint:
+        try:
+            subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", branch_hint],
+                stderr=subprocess.DEVNULL, text=True
+            )
+        except subprocess.CalledProcessError:
+            branch_hint = None
+    if branch_hint:
+        try:
+            upstream = subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", "--abbrev-ref", f"{branch_hint}@{{upstream}}"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            if upstream:
+                return branch_hint, upstream
+        except subprocess.CalledProcessError:
+            pass
+        try:
+            subprocess.check_output(
+                ["git", "-C", wt, "rev-parse", f"origin/{branch_hint}"],
+                stderr=subprocess.DEVNULL, text=True
+            )
+            return branch_hint, f"origin/{branch_hint}"
+        except subprocess.CalledProcessError:
+            pass
     try:
         subprocess.check_output(
             ["git", "-C", wt, "rev-parse", "@{u}"],
             stderr=subprocess.DEVNULL, text=True
         )
+        return "HEAD", "@{u}"
     except subprocess.CalledProcessError:
+        return None, None
+
+def get_remote_diff(wt, branch_hint=None):
+    local_ref, upstream = resolve_upstream(wt, branch_hint)
+    if not upstream:
         return c(DIM, "no remote")
     try:
         ahead = int(subprocess.check_output(
-            ["git", "-C", wt, "rev-list", "--count", "@{u}..HEAD"],
+            ["git", "-C", wt, "rev-list", "--count", f"{upstream}..{local_ref}"],
             stderr=subprocess.DEVNULL, text=True
         ).strip() or "0")
         behind = int(subprocess.check_output(
-            ["git", "-C", wt, "rev-list", "--count", "HEAD..@{u}"],
+            ["git", "-C", wt, "rev-list", "--count", f"{local_ref}..{upstream}"],
             stderr=subprocess.DEVNULL, text=True
         ).strip() or "0")
     except subprocess.CalledProcessError:
@@ -984,21 +1029,20 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
             sc, st = get_state(folder_paths[folder], compare_to=parent_name)
         except Exception:
             sc, st = ("unknown", "?")
+    mark = c(GREEN, "\u25cf") if is_linked else " "
+    conflict_mark = c(ORANGE, "!") if sc == "conflict" else ""
     if sc == "conflict":
         name_disp = c(f"{BOLD};{ORANGE}", name) if is_linked else c(ORANGE, name)
-        mark = c(ORANGE, "\u25cf") if is_linked else c(ORANGE, "!")
     elif is_linked:
         name_disp = c(BOLD, name)
-        mark = c(GREEN, "\u25cf")
     else:
         name_disp = name
-        mark = " "
     suffix = ""
     if not is_orphan and folder and folder != name:
         suffix = " " + c(DIM, f"[wt: {folder}]")
     if is_orphan and head != "?" and head != name:
         suffix = " " + c(DIM, f"[head: {head}]")
-    left = f"{mark}{c(DIM, prefix)}{name_disp}{suffix}"
+    left = f"{mark}{conflict_mark}{c(DIM, prefix)}{name_disp}{suffix}"
     if folder is None or folder not in folder_paths:
         right = c(DIM, "(no worktree)")
     elif sc is None:
@@ -1006,7 +1050,8 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
     else:
         right = colorize_state(sc, st)
         if parent_name is not None:
-            rdiff = get_remote_diff(folder_paths[folder])
+            branch_hint = name if not is_orphan else folder_to_head.get(name)
+            rdiff = get_remote_diff(folder_paths[folder], branch_hint=branch_hint)
             if rdiff:
                 right = f"{right}  {rdiff}"
     return left, right
@@ -1049,14 +1094,30 @@ def branches_in_conflict():
             out.append(fd)
     return out
 
-linked_disp = c(BOLD, linked) if linked else c(DIM, "(none)")
-items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}"))
+def branch_name_for_linked_folder(folder):
+    if not folder:
+        return ""
+    for b in sorted(displayed_branches):
+        if find_folder(b) == folder:
+            return b
+    return folder
+
+linked_branch = branch_name_for_linked_folder(linked)
+linked_disp = c(BOLD, linked_branch or linked) if linked else c(DIM, "(none)")
+linked_extra = ""
+conflicts = branches_in_conflict()
+if linked_branch and linked_branch in conflicts and linked in folder_paths:
+    try:
+        _, st = get_state(folder_paths[linked])
+        linked_extra = " " + c(ORANGE, st)
+    except Exception:
+        linked_extra = " " + c(ORANGE, "conflict")
+items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}{linked_extra}"))
 if base:
     items.append(("text", f"{c(DIM, 'Base:  ')} {base}"))
-conflicts = branches_in_conflict()
-if conflicts:
-    conflict_disp = c(ORANGE, ", ".join(conflicts))
-    items.append(("text", f"{c(DIM, 'Conflict:')} {conflict_disp}"))
+other_conflicts = [b for b in conflicts if b != linked_branch]
+if other_conflicts:
+    items.append(("text", f"{c(DIM, 'Conflict:')} {c(ORANGE, ', '.join(other_conflicts))}"))
 items.append(("blank",))
 
 items.append(("section", "Stack"))
