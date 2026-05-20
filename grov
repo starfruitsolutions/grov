@@ -274,6 +274,56 @@ PY
   return 1
 }
 
+# Echo "local_ref upstream_ref" for ahead/behind (branch ref, not detached HEAD).
+push_resolve_upstream() {
+  local wt=$1
+  local branch=$2
+  local upstream gp sub
+  if [[ -z "$branch" ]] || ! git -C "$wt" rev-parse --verify "$branch" &>/dev/null; then
+    branch=""
+    for sub in rebase-merge rebase-apply; do
+      gp=$(git -C "$wt" rev-parse --git-path "$sub" 2>/dev/null || true)
+      if [[ -n "$gp" && -f "$gp/head-name" ]]; then
+        branch=$(sed 's|^refs/heads/||' <"$gp/head-name")
+        break
+      fi
+    done
+    if [[ -z "$branch" ]]; then
+      branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+      [[ "$branch" == "HEAD" ]] && branch=""
+    fi
+  fi
+  if [[ -n "$branch" ]]; then
+    upstream=$(git -C "$wt" rev-parse --abbrev-ref "${branch}@{upstream}" 2>/dev/null) || true
+    if [[ -n "$upstream" ]]; then
+      echo "$branch $upstream"
+      return 0
+    fi
+    if git -C "$wt" rev-parse --verify "origin/$branch" &>/dev/null; then
+      echo "$branch origin/$branch"
+      return 0
+    fi
+  fi
+  if git -C "$wt" rev-parse @{u} &>/dev/null; then
+    echo "HEAD @{u}"
+    return 0
+  fi
+  return 1
+}
+
+# Echo "ahead behind" (space-separated).
+push_ahead_behind() {
+  local wt=$1
+  local branch=$2
+  local refs local_ref upstream ahead behind
+  refs=$(push_resolve_upstream "$wt" "$branch") || { echo "0 0"; return 1; }
+  local_ref=${refs%% *}
+  upstream=${refs#* }
+  ahead=$(git -C "$wt" rev-list --count "${upstream}..${local_ref}" 2>/dev/null || echo "0")
+  behind=$(git -C "$wt" rev-list --count "${local_ref}..${upstream}" 2>/dev/null || echo "0")
+  echo "$ahead $behind"
+}
+
 get_primary_dir() {
   local root=$1
   cat "$root/.grov/primary-dir" 2>/dev/null || echo "master"
@@ -1507,57 +1557,97 @@ cmd_push() {
   fi
 
   echo "$header"
-  local br wt_path ahead
+  local -a planned_branches=()
   while IFS= read -r br; do
     [[ -z "$br" ]] && continue
+    planned_branches+=("$br")
+  done <<<"$branches_list"
+
+  local -a do_branches=() do_wtpaths=() do_kinds=() do_remotes=() do_push_names=()
+  local br wt_path info n d ahead behind ab
+  for br in "${planned_branches[@]}"; do
     materialize_worktree_if_needed "$root" "$br"
-    wt_path=""
-    local info n d
     info=$(resolve_dirs_for_branch_head "$root" "$br")
-    n=${info%% *}
     d=${info#* }
-    wt_path=$(get_worktree_path "$root" "${d%% *}")
-    wt_path=$(readlink -f "$wt_path" 2>/dev/null || echo "$wt_path")
-    if ! git -C "$wt_path" rev-parse @{u} &>/dev/null; then
-      local remote="origin"
-      local push_branch="$br"
-      if [[ "$yes" != true ]]; then
-        echo -n "  $br: no upstream. Push --set-upstream to [$remote/$push_branch]: "
-        read -r upstream_input </dev/tty
-        if [[ -n "$upstream_input" ]]; then
-          if [[ "$upstream_input" == */* ]]; then
-            remote="${upstream_input%%/*}"
-            push_branch="${upstream_input#*/}"
-          else
-            remote="$upstream_input"
-          fi
-        fi
+    wt_path=$(readlink -f "$(get_worktree_path "$root" "${d%% *}")" 2>/dev/null || get_worktree_path "$root" "${d%% *}")
+    if ! push_resolve_upstream "$wt_path" "$br" &>/dev/null; then
+      echo "  $br: no upstream"
+      do_branches+=("$br")
+      do_wtpaths+=("$wt_path")
+      do_kinds+=("setup")
+      do_remotes+=("origin")
+      do_push_names+=("$br")
+      continue
+    fi
+    ab=$(push_ahead_behind "$wt_path" "$br")
+    ahead=${ab%% *}
+    behind=${ab#* }
+    if [[ "$ahead" == "0" && "$behind" == "0" ]]; then
+      echo "  $br: nothing to push"
+      continue
+    fi
+    if [[ "$ahead" == "0" ]]; then
+      echo "  $br: behind $behind (nothing to push)"
+      continue
+    fi
+    local ab_msg="ahead $ahead"
+    [[ "$behind" != "0" ]] && ab_msg="$ab_msg, behind $behind"
+    echo "  $br: $ab_msg (push with --force-with-lease)"
+    do_branches+=("$br")
+    do_wtpaths+=("$wt_path")
+    do_kinds+=("push")
+    do_remotes+=("origin")
+    do_push_names+=("$br")
+  done
+
+  local n=${#do_branches[@]}
+  [[ "$n" -eq 0 ]] && return 0
+
+  if [[ "$dry" == true ]]; then
+    local i
+    for ((i = 0; i < n; i++)); do
+      if [[ "${do_kinds[$i]}" == "setup" ]]; then
+        echo "    dry-run: git push --set-upstream ${do_remotes[$i]} ${do_branches[$i]}:${do_push_names[$i]}"
+      else
+        echo "    dry-run: git push --force-with-lease ${do_remotes[$i]} ${do_branches[$i]}"
       fi
-      if [[ "$dry" == true ]]; then
-        echo "    dry-run: git push --set-upstream $remote $br:$push_branch"
-        continue
+    done
+    return 0
+  fi
+
+  local batch_confirm=false
+  [[ ${#planned_branches[@]} -gt 1 ]] && batch_confirm=true
+
+  if [[ "$yes" != true ]]; then
+    if [[ "$batch_confirm" == true ]]; then
+      echo -n "Push $n branch(es)? [y/N] "
+      read -r ans </dev/tty
+      [[ "$ans" != [yY]* ]] && return 0
+    else
+      echo -n "Push ${do_branches[0]}? [y/N] "
+      read -r ans </dev/tty
+      [[ "$ans" != [yY]* ]] && return 0
+    fi
+  fi
+
+  local i remote push_branch upstream_input
+  for ((i = 0; i < n; i++)); do
+    br="${do_branches[$i]}"
+    wt_path="${do_wtpaths[$i]}"
+    if [[ "${do_kinds[$i]}" == "setup" ]]; then
+      remote="${do_remotes[$i]}"
+      push_branch="${do_push_names[$i]}"
+      if [[ "$yes" != true && "$batch_confirm" != true ]]; then
+        echo -n "  $br: set upstream to [$remote/$push_branch]? [y/N] "
+        read -r upstream_input </dev/tty
+        [[ "$upstream_input" != [yY]* ]] && continue
       fi
       echo "  $br: setting upstream to $remote/$push_branch"
       git -C "$wt_path" push --set-upstream "$remote" "$br:$push_branch"
       continue
     fi
-    ahead=$(git -C "$wt_path" rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
-    if [[ "$ahead" == "0" ]]; then
-      echo "  $br: nothing to push"
-      continue
-    fi
-    echo "  $br: ahead $ahead (push with --force-with-lease)"
-    if [[ "$dry" == true ]]; then
-      echo "    dry-run: git push --force-with-lease origin $br"
-      continue
-    fi
-    if [[ "$yes" != true ]]; then
-      echo -n "    Push $br? [y/N] "
-      read -r ans </dev/tty
-      [[ "$ans" != [yY]* ]] && continue
-    fi
-    git -C "$wt_path" push --force-with-lease origin "$br"
-  done <<<"$branches_list"
+    git -C "$wt_path" push --force-with-lease "${do_remotes[$i]}" "$br"
+  done
 }
 
 cmd_parent() {
