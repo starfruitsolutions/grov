@@ -762,7 +762,7 @@ import json, os, re, subprocess, sys
 root, linked, base = sys.argv[1], sys.argv[2], sys.argv[3]
 use_color = sys.argv[4] == "1"
 
-BOLD, DIM, GREEN, YELLOW, CYAN, RED = "1", "2", "32", "33", "36", "31"
+BOLD, DIM, GREEN, YELLOW, CYAN, RED, ORANGE = "1", "2", "32", "33", "36", "31", "38;5;208"
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 def c(code, text):
@@ -773,7 +773,7 @@ def c(code, text):
 def vlen(s):
     return len(ANSI_RE.sub("", s))
 
-def get_state(wt, compare_to=None):
+def is_rebase_in_progress(wt):
     for sub in ("rebase-merge", "rebase-apply"):
         try:
             gp = subprocess.check_output(
@@ -783,7 +783,25 @@ def get_state(wt, compare_to=None):
         except subprocess.CalledProcessError:
             gp = ""
         if gp and os.path.isdir(gp):
-            return ("rebasing", "rebase in progress")
+            return True
+    return False
+
+def has_unmerged(wt):
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", wt, "diff", "--name-only", "--diff-filter=U"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return bool(out)
+    except subprocess.CalledProcessError:
+        return False
+
+def get_state(wt, compare_to=None):
+    rebase = is_rebase_in_progress(wt)
+    if has_unmerged(wt):
+        return ("conflict", "rebase conflict" if rebase else "merge conflict")
+    if rebase:
+        return ("rebasing", "rebase in progress")
     try:
         s = subprocess.check_output(
             ["git", "-C", wt, "status", "-s"],
@@ -840,6 +858,7 @@ def colorize_state(code, text):
     if code == "dirty":        return c(YELLOW, text)
     if code == "diverged":     return c(CYAN, text)
     if code == "preformatted": return text
+    if code == "conflict":     return c(ORANGE, text)
     if code == "rebasing":     return c(RED, text)
     if code == "noupstream":   return c(DIM, text)
     return text
@@ -959,8 +978,21 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
         folder = find_folder(name)
         head = name
     is_linked = folder is not None and folder == linked
-    name_disp = c(BOLD, name) if is_linked else name
-    mark = c(GREEN, "\u25cf") if is_linked else " "
+    sc = st = None
+    if folder is not None and folder in folder_paths:
+        try:
+            sc, st = get_state(folder_paths[folder], compare_to=parent_name)
+        except Exception:
+            sc, st = ("unknown", "?")
+    if sc == "conflict":
+        name_disp = c(f"{BOLD};{ORANGE}", name) if is_linked else c(ORANGE, name)
+        mark = c(ORANGE, "\u25cf") if is_linked else c(ORANGE, "!")
+    elif is_linked:
+        name_disp = c(BOLD, name)
+        mark = c(GREEN, "\u25cf")
+    else:
+        name_disp = name
+        mark = " "
     suffix = ""
     if not is_orphan and folder and folder != name:
         suffix = " " + c(DIM, f"[wt: {folder}]")
@@ -969,11 +1001,9 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
     left = f"{mark}{c(DIM, prefix)}{name_disp}{suffix}"
     if folder is None or folder not in folder_paths:
         right = c(DIM, "(no worktree)")
+    elif sc is None:
+        right = "?"
     else:
-        try:
-            sc, st = get_state(folder_paths[folder], compare_to=parent_name)
-        except Exception:
-            sc, st = ("unknown", "?")
         right = colorize_state(sc, st)
         if parent_name is not None:
             rdiff = get_remote_diff(folder_paths[folder])
@@ -993,10 +1023,40 @@ def render(name, prefix_for_this, prefix_for_kids, parent_name=None):
         ext = "    " if last else "\u2502   "
         render(k, prefix_for_kids + connector, prefix_for_kids + ext, parent_name=name)
 
+def branches_in_conflict():
+    seen = set()
+    out = []
+    for b in sorted(displayed_branches):
+        fd = find_folder(b)
+        if not fd or fd not in folder_paths:
+            continue
+        try:
+            sc, _ = get_state(folder_paths[fd])
+        except Exception:
+            continue
+        if sc == "conflict" and b not in seen:
+            seen.add(b)
+            out.append(b)
+    for fd in sorted(folder_paths.keys()):
+        if fd in displayed_branches:
+            continue
+        try:
+            sc, _ = get_state(folder_paths[fd])
+        except Exception:
+            continue
+        if sc == "conflict" and fd not in seen:
+            seen.add(fd)
+            out.append(fd)
+    return out
+
 linked_disp = c(BOLD, linked) if linked else c(DIM, "(none)")
 items.append(("text", f"{c(DIM, 'Linked:')} {linked_disp}"))
 if base:
     items.append(("text", f"{c(DIM, 'Base:  ')} {base}"))
+conflicts = branches_in_conflict()
+if conflicts:
+    conflict_disp = c(ORANGE, ", ".join(conflicts))
+    items.append(("text", f"{c(DIM, 'Conflict:')} {conflict_disp}"))
 items.append(("blank",))
 
 items.append(("section", "Stack"))
