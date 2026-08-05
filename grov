@@ -9,10 +9,11 @@
 #   add [-b] <branch>       create worktree only (no link change)
 #   status [--no-fetch]     list worktrees, stack tree, linked branch, git state (fetches by default)
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
-#   restack [--all] [--yes] [--continue|--abort] [[<branch>|<a>..<b>] [--cascade]]   rebase onto parents (ordered)
-#   push [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]   push with --force-with-lease (default: all pushable, prompt)
-#   pull [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]   git pull upstream (default: all pullable, prompt)
-#   remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); default one branch; no --all
+#   restack [--yes] [--continue|--abort] [<spec>]   rebase onto parents (default: @)
+#   push [--yes] [--dry-run] [<spec>]   push with --force-with-lease (default: @)
+#   pull [--yes] [--dry-run] [<spec>]   git pull upstream (default: @)
+#   remove [--yes] <spec>   remove worktree(s); spec required
+#   Stack specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::
 #   parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (defaults parent to base)
 #   base [<branch>]         show or set the global base (trunk) branch
 #   stack remove <branch>   remove leaf from stack metadata + worktree
@@ -563,10 +564,11 @@ usage() {
   echo "  switch <branch>          point workspace at existing worktree only"
   echo "  add [-b] <branch>        create worktree only (no link change)"
   echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
-  echo "  remove [--yes] <branch>|<a>..<b> [--cascade]   remove worktree(s); no --all"
-  echo "  restack [--all] [--yes] [--continue|--abort] [[branch|<a>..<b>] [--single]]"
-  echo "  push [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--cascade]]   (default: all pushable, prompt)"
-  echo "  pull [--all] [--yes] [--dry-run] [[branch|<a>..<b>] [--cascade]]   (default: all pullable, prompt)"
+  echo "  remove [--yes] <spec>        remove worktree(s); spec required"
+  echo "  restack [--yes] [--continue|--abort] [<spec>]   (default: @)"
+  echo "  push [--yes] [--dry-run] [<spec>]   (default: @)"
+  echo "  pull [--yes] [--dry-run] [<spec>]   (default: @)"
+  echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::"
   echo "  parent <child> [parent] [--yes] [--no-rebase]   add/move branch in stack (default parent=base)"
   echo "  base [<branch>]          show or set the global base (trunk) branch"
   echo "  stack remove <branch>    remove stack leaf + worktree"
@@ -891,7 +893,7 @@ remove_one_branch() {
     local rc=$?
     set -e
     if [[ "$rc" -eq 2 ]]; then
-      echo "Error: Branch '$branch' has stacked children. Use --cascade or remove children first." >&2
+      echo "Error: Branch '$branch' has stacked children. Use '${branch}::' or remove children first." >&2
       return 1
     fi
     [[ "$rc" -ne 0 ]] && return "$rc"
@@ -924,15 +926,13 @@ cmd_remove() {
   stack_ensure_file "$root"
   require_python3
   stack_scope_parse_args "$root" "$@" || {
-    echo "Usage: grov remove [--yes] <branch>|<a>..<b> [--cascade]" >&2
+    echo "Usage: grov remove [--yes] <spec>" >&2
+    echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
-  [[ "$SCR_ALL" == true ]] && {
-    echo "Error: grov remove does not support --all." >&2
-    exit 1
-  }
-  [[ "$SCR_MODE" == "all" ]] && {
-    echo "Usage: grov remove [--yes] <branch>|<a>..<b> [--cascade]" >&2
+  [[ "$SCR_MODE" == "none" ]] && {
+    echo "Usage: grov remove [--yes] <spec>" >&2
+    echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
   [[ "$SCR_DRY" == true ]] && {
@@ -943,7 +943,9 @@ cmd_remove() {
   local header="" branches_list
   case "$SCR_MODE" in
     single) header="Remove '${SCR_ARG}':" ;;
-    cascade) header="Remove '${SCR_ARG}' and descendants (leaves first):" ;;
+    upstack) header="Remove '${SCR_ARG}::' (leaves first):" ;;
+    downstack) header="Remove '::${SCR_ARG}' (leaves first):" ;;
+    stack) header="Remove entire stack '::' (leaves first):" ;;
     range) header="Remove chain '${SCR_FROM}..${SCR_TO}' (leaves first):" ;;
   esac
   branches_list=$(stack_scope_resolve_branches_remove_order "$root") || exit 1
@@ -1547,19 +1549,22 @@ cmd_restack() {
   stack_ensure_file "$root"
   require_python3
   stack_scope_parse_args "$root" "$@" || {
-    echo "Usage: grov restack [--all] [--yes] [--continue|--abort] [[<branch>|<a>..<b>] [--cascade]]" >&2
+    echo "Usage: grov restack [--yes] [--continue|--abort] [<spec>]" >&2
+    echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
+  stack_scope_default_to_current "$root" || exit 1
 
   local header="" branches_filter="" mapfile_order
   case "$SCR_MODE" in
-    all) header="Restack all stacked branches (parent order):" ;;
     single) header="Restack '${SCR_ARG}':" ;;
-    cascade) header="Restack '${SCR_ARG}' and descendants (parent order):" ;;
+    upstack) header="Restack '${SCR_ARG}::' (parent order):" ;;
+    downstack) header="Restack '::${SCR_ARG}' (parent order):" ;;
+    stack) header="Restack entire stack '::' (parent order):" ;;
     range) header="Restack chain '${SCR_FROM}..${SCR_TO}' (parent order):" ;;
   esac
 
-  branches_filter=$(stack_scope_resolve_branches "$root")
+  branches_filter=$(stack_scope_resolve_branches "$root") || exit 1
   mapfile -t mapfile_order < <(collect_restack_pairs "$root" "$branches_filter")
   if [[ ${#mapfile_order[@]} -eq 0 ]]; then
     echo "Nothing to restack."
@@ -1573,7 +1578,7 @@ cmd_restack() {
     echo "  $child onto $parent"
   done
 
-  if [[ "$SCR_YES" != true && "$SCR_ALL" != true ]]; then
+  if [[ "$SCR_YES" != true ]]; then
     echo -n "Restack ${#mapfile_order[@]} branch(es)? [y/N] "
     read -r ans </dev/tty
     [[ "$ans" != [yY]* ]] && return 0
@@ -1688,6 +1693,38 @@ for b in sorted(seen, key=lambda x: (depth(x), x)):
 PY
 }
 
+# Walk parent chain from <start> inclusive up to stack root; emits parent-first.
+collect_ancestor_branches() {
+  local root=$1
+  local start=$2
+  require_python3
+  python3 - "$root" "$start" <<'PY'
+import json, os, sys
+
+root, start = sys.argv[1:3]
+with open(os.path.join(root, ".grov", "stack.json")) as f:
+    nodes = json.load(f).get("nodes") or {}
+
+if start not in nodes:
+    print(start)
+    sys.exit(0)
+
+chain = []
+cur = start
+seen = set()
+while cur and cur not in seen:
+    seen.add(cur)
+    chain.append(cur)
+    meta = nodes.get(cur) or {}
+    p = meta.get("parent")
+    if not p:
+        break
+    cur = p
+for b in reversed(chain):
+    print(b)
+PY
+}
+
 # Walk parent chain from <to> (incl) up to <from> (excl); emits parent-first.
 collect_stack_range() {
   local root=$1
@@ -1716,15 +1753,15 @@ for b in reversed(chain):
 PY
 }
 
-# All stack nodes (depth order) plus worktree HEAD branches not already listed.
-collect_all_branches() {
+# Every node in stack.json (depth order). Does not include orphan worktrees.
+collect_stack_forest() {
   local root=$1
   require_python3
   stack_ensure_file "$root"
-  python3 - "$root" "$BRANCHES_DIR_NAME" <<'PY'
-import json, os, subprocess, sys
+  python3 - "$root" <<'PY'
+import json, os, sys
 
-root, branches_dir = sys.argv[1:3]
+root = sys.argv[1]
 with open(os.path.join(root, ".grov", "stack.json")) as f:
     nodes = json.load(f).get("nodes") or {}
 
@@ -1741,34 +1778,7 @@ def depth(b):
         cur = p
     return d
 
-seen = set()
-out = []
 for b in sorted(nodes.keys(), key=lambda x: (depth(x), x)):
-    if b not in seen:
-        seen.add(b)
-        out.append(b)
-
-bd = os.path.join(root, branches_dir)
-if os.path.isdir(bd):
-    for folder in sorted(os.listdir(bd)):
-        p = os.path.join(bd, folder)
-        if not os.path.isdir(p):
-            continue
-        try:
-            head = subprocess.check_output(
-                ["git", "-C", p, "rev-parse", "--abbrev-ref", "HEAD"],
-                stderr=subprocess.DEVNULL, text=True,
-            ).strip()
-        except subprocess.CalledProcessError:
-            head = folder
-        if head and head != "HEAD" and head not in seen:
-            seen.add(head)
-            out.append(head)
-        elif folder not in seen and folder not in out:
-            seen.add(folder)
-            out.append(folder)
-
-for b in out:
     print(b)
 PY
 }
@@ -1814,33 +1824,75 @@ for child in ordered:
 PY
 }
 
-# Sets: SCR_YES SCR_ALL SCR_CASCADE SCR_DRY SCR_MODE SCR_ARG SCR_FROM SCR_TO
-# SCR_MODE: all | single | cascade | range
+# Sets: SCR_YES SCR_DRY SCR_MODE SCR_ARG SCR_FROM SCR_TO SCR_SPEC
+# SCR_MODE: none | single | upstack | downstack | stack | range
 stack_scope_default_branch() {
   local root=$1
   get_linked_git_branch "$root" 2>/dev/null || get_linked_branch "$root" 2>/dev/null || true
 }
 
-# Optional: pass root as $1 for --cascade default branch. Rejects --single (removed).
+stack_scope_resolve_token() {
+  local root=$1
+  local tok=$2
+  if [[ "$tok" == "@" ]]; then
+    local cur
+    cur=$(stack_scope_default_branch "$root")
+    [[ -z "$cur" ]] && {
+      echo "Error: no workspace branch (@)." >&2
+      return 1
+    }
+    echo "$cur"
+  else
+    [[ -z "$tok" ]] && {
+      echo "Error: empty branch in stack spec." >&2
+      return 1
+    }
+    echo "$tok"
+  fi
+}
+
+# When no spec was given, treat as @: current workspace branch only.
+stack_scope_default_to_current() {
+  local root=$1
+  [[ "$SCR_MODE" != "none" ]] && return 0
+  SCR_SPEC="@"
+  SCR_MODE="single"
+  SCR_ARG=$(stack_scope_resolve_token "$root" "@") || return 1
+  return 0
+}
+
+# Optional: pass root as $1. Spec grammar: @ | branch | a..b | branch:: | ::branch | ::
 stack_scope_parse_args() {
   local root="${1:-}"
   [[ -n "$root" && "$root" != --* ]] && shift || root=""
   SCR_YES=false
-  SCR_ALL=false
-  SCR_CASCADE=false
   SCR_DRY=false
-  SCR_MODE=""
+  SCR_MODE="none"
   SCR_ARG=""
   SCR_FROM=""
   SCR_TO=""
+  SCR_SPEC=""
   local positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --yes) SCR_YES=true ;;
-      --all) SCR_ALL=true ;;
-      --cascade) SCR_CASCADE=true ;;
-      --single) echo "Error: --single was removed; use a branch alone for one target, or --cascade for descendants." >&2; return 1 ;;
+      --yes|-y) SCR_YES=true ;;
       --dry-run) SCR_DRY=true ;;
+      --all)
+        echo "Error: --all was removed; use '::' for the whole stack, and --yes to skip prompts." >&2
+        return 1
+        ;;
+      --cascade)
+        echo "Error: --cascade was removed; use '<branch>::' or '@::' for a branch and its upstack." >&2
+        return 1
+        ;;
+      --single)
+        echo "Error: --single was removed; pass a branch alone for one target, or '<branch>::' for upstack." >&2
+        return 1
+        ;;
+      --from)
+        echo "Error: --from was removed; use '<branch>::' or '@::'." >&2
+        return 1
+        ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
       *) positional+=("$1") ;;
     esac
@@ -1850,43 +1902,50 @@ stack_scope_parse_args() {
     echo "Error: too many positional arguments." >&2
     return 1
   fi
-  if [[ ${#positional[@]} -eq 1 ]]; then
-    SCR_ARG="${positional[0]}"
-    if [[ "$SCR_ARG" == *..*..* ]]; then
-      echo "Error: invalid range syntax '$SCR_ARG' (expected <a>..<b>)." >&2
-      return 1
-    fi
-    if [[ "$SCR_ARG" == *..* ]]; then
-      [[ "$SCR_CASCADE" == true ]] && {
-        echo "Error: --cascade cannot be used with a range (a..b)." >&2
-        return 1
-      }
-      SCR_MODE="range"
-      SCR_FROM="${SCR_ARG%%..*}"
-      SCR_TO="${SCR_ARG##*..}"
-      [[ -z "$SCR_FROM" || -z "$SCR_TO" ]] && {
-        echo "Error: invalid range '$SCR_ARG'." >&2
-        return 1
-      }
-    elif [[ "$SCR_CASCADE" == true ]]; then
-      SCR_MODE="cascade"
-    else
-      SCR_MODE="single"
-    fi
-  elif [[ "$SCR_CASCADE" == true ]]; then
-    [[ -z "$root" ]] && {
-      echo "Error: --cascade without a branch requires a grov project root." >&2
-      return 1
-    }
-    SCR_ARG=$(stack_scope_default_branch "$root")
-    [[ -z "$SCR_ARG" ]] && {
-      echo "Error: --cascade requires a branch (no workspace mount)." >&2
-      return 1
-    }
-    SCR_MODE="cascade"
-  else
-    SCR_MODE="all"
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    SCR_MODE="none"
+    return 0
   fi
+
+  SCR_SPEC="${positional[0]}"
+  local spec="$SCR_SPEC"
+
+  if [[ "$spec" == "::" ]]; then
+    SCR_MODE="stack"
+    return 0
+  fi
+
+  if [[ "$spec" == ::* ]]; then
+    SCR_MODE="downstack"
+    SCR_ARG=$(stack_scope_resolve_token "$root" "${spec#::}") || return 1
+    return 0
+  fi
+
+  if [[ "$spec" == *:: ]]; then
+    SCR_MODE="upstack"
+    SCR_ARG=$(stack_scope_resolve_token "$root" "${spec%::}") || return 1
+    return 0
+  fi
+
+  if [[ "$spec" == *::* ]]; then
+    echo "Error: invalid spec '$spec' (use 'a..b' for a chain, or 'a::' / '::b' for open stack walks)." >&2
+    return 1
+  fi
+
+  if [[ "$spec" == *..*..* ]]; then
+    echo "Error: invalid range syntax '$spec' (expected <a>..<b>)." >&2
+    return 1
+  fi
+
+  if [[ "$spec" == *..* ]]; then
+    SCR_MODE="range"
+    SCR_FROM=$(stack_scope_resolve_token "$root" "${spec%%..*}") || return 1
+    SCR_TO=$(stack_scope_resolve_token "$root" "${spec##*..}") || return 1
+    return 0
+  fi
+
+  SCR_MODE="single"
+  SCR_ARG=$(stack_scope_resolve_token "$root" "$spec") || return 1
   return 0
 }
 
@@ -1894,10 +1953,19 @@ stack_scope_parse_args() {
 stack_scope_resolve_branches() {
   local root=$1
   case "$SCR_MODE" in
-    all) collect_all_branches "$root" ;;
+    none)
+      echo "Error: internal: stack scope mode is none." >&2
+      return 1
+      ;;
     single) echo "$SCR_ARG" ;;
-    cascade) collect_subtree_branches "$root" "$SCR_ARG" ;;
+    upstack) collect_subtree_branches "$root" "$SCR_ARG" ;;
+    downstack) collect_ancestor_branches "$root" "$SCR_ARG" ;;
+    stack) collect_stack_forest "$root" ;;
     range) collect_stack_range "$root" "$SCR_FROM" "$SCR_TO" ;;
+    *)
+      echo "Error: unknown stack scope mode '$SCR_MODE'." >&2
+      return 1
+      ;;
   esac
 }
 
@@ -1905,7 +1973,7 @@ stack_scope_resolve_branches() {
 stack_scope_resolve_branches_remove_order() {
   local root=$1
   local lines
-  lines=$(stack_scope_resolve_branches "$root")
+  lines=$(stack_scope_resolve_branches "$root") || return 1
   [[ -z "$lines" ]] && return 0
   if [[ "$SCR_MODE" == "single" ]]; then
     echo "$lines"
@@ -2111,19 +2179,22 @@ cmd_push() {
   stack_ensure_file "$root"
   require_python3
   stack_scope_parse_args "$root" "$@" || {
-    echo "Usage: grov push [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]" >&2
+    echo "Usage: grov push [--yes] [--dry-run] [<spec>]" >&2
+    echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
+  stack_scope_default_to_current "$root" || exit 1
 
   local yes=false dry=false
-  [[ "$SCR_YES" == true || "$SCR_ALL" == true ]] && yes=true
+  [[ "$SCR_YES" == true ]] && yes=true
   [[ "$SCR_DRY" == true ]] && dry=true
 
   local branches_list="" header=""
   case "$SCR_MODE" in
-    all) header="Push all pushable branches (parent-before-child):" ;;
     single) header="Push '${SCR_ARG}':" ;;
-    cascade) header="Push '${SCR_ARG}' and descendants (parent-before-child):" ;;
+    upstack) header="Push '${SCR_ARG}::' (parent-before-child):" ;;
+    downstack) header="Push '::${SCR_ARG}' (parent-before-child):" ;;
+    stack) header="Push entire stack '::' (parent-before-child):" ;;
     range) header="Push chain '${SCR_FROM}..${SCR_TO}' (parent-before-child):" ;;
   esac
   branches_list=$(stack_scope_resolve_branches "$root") || exit 1
@@ -2220,19 +2291,22 @@ cmd_pull() {
   stack_ensure_file "$root"
   require_python3
   stack_scope_parse_args "$root" "$@" || {
-    echo "Usage: grov pull [--all] [--yes] [--dry-run] [[<branch>|<a>..<b>] [--cascade]]" >&2
+    echo "Usage: grov pull [--yes] [--dry-run] [<spec>]" >&2
+    echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
+  stack_scope_default_to_current "$root" || exit 1
 
   local yes=false dry=false
-  [[ "$SCR_YES" == true || "$SCR_ALL" == true ]] && yes=true
+  [[ "$SCR_YES" == true ]] && yes=true
   [[ "$SCR_DRY" == true ]] && dry=true
 
   local branches_list="" header=""
   case "$SCR_MODE" in
-    all) header="Pull all pullable branches (parent-before-child):" ;;
     single) header="Pull '${SCR_ARG}':" ;;
-    cascade) header="Pull '${SCR_ARG}' and descendants (parent-before-child):" ;;
+    upstack) header="Pull '${SCR_ARG}::' (parent-before-child):" ;;
+    downstack) header="Pull '::${SCR_ARG}' (parent-before-child):" ;;
+    stack) header="Pull entire stack '::' (parent-before-child):" ;;
     range) header="Pull chain '${SCR_FROM}..${SCR_TO}' (parent-before-child):" ;;
   esac
   branches_list=$(stack_scope_resolve_branches "$root") || exit 1

@@ -97,13 +97,11 @@ _grov_complete_stack_scope() {
   local cur prev words cword
   _init_completion -n : 2>/dev/null || _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null
 
-  local i has_yes= has_all= has_cascade= has_dry= has_positional=
+  local i has_yes= has_dry= has_positional=
   local cmd_name="${words[1]}"
   for ((i = 2; i < cword; i++)); do
     case "${words[i]}" in
-      --yes) has_yes=1 ;;
-      --all) has_all=1 ;;
-      --cascade) has_cascade=1 ;;
+      --yes|-y) has_yes=1 ;;
       --dry-run) has_dry=1 ;;
       --continue|--abort) ;;
       --*) ;;
@@ -113,8 +111,6 @@ _grov_complete_stack_scope() {
 
   local opts=""
   [[ -z "$has_yes" ]] && opts+="--yes "
-  [[ -z "$has_all" && "$cmd_name" != "remove" ]] && opts+="--all "
-  [[ -z "$has_cascade" ]] && opts+="--cascade "
   [[ -z "$has_dry" && ( "$cmd_name" == "push" || "$cmd_name" == "pull" ) ]] && opts+="--dry-run "
 
   if [[ "$cur" == -* ]]; then
@@ -126,13 +122,25 @@ _grov_complete_stack_scope() {
     compopt +o default 2>/dev/null
     local branches reply before after
     branches=$(_grov_list_git_branches)
-    if [[ "$cur" == *..* ]]; then
+    if [[ "$cur" == ::* && "$cur" != "::" ]]; then
+      after="${cur#::}"
+      reply=($(compgen -W "$branches" -- "$after"))
+      COMPREPLY=("${reply[@]/#/::}")
+    elif [[ "$cur" == *..* ]]; then
       before="${cur%%..*}"
       after="${cur#*..}"
-      reply=($(compgen -W "$branches" -- "$after"))
+      reply=($(compgen -W "$branches @ " -- "$after"))
       COMPREPLY=("${reply[@]/#/${before}..}")
+    elif [[ "$cur" == *:: ]]; then
+      COMPREPLY=()
     else
-      COMPREPLY=($(compgen -W "$branches" -- "$cur"))
+      COMPREPLY=($(compgen -W "@ :: $branches" -- "$cur"))
+      # Also offer branch:: completions when a unique branch prefix matches
+      reply=($(compgen -W "$branches" -- "$cur"))
+      local b
+      for b in "${reply[@]}"; do
+        COMPREPLY+=("${b}::")
+      done
     fi
     [[ -n "$opts" ]] && COMPREPLY+=($(compgen -W "${opts%" "}" -- "$cur"))
     return
@@ -182,7 +190,7 @@ _grov() {
     status) ;;
     restack)
       if [[ $cword -eq 2 && "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "--continue --abort --all --yes --cascade" -- "$cur"))
+        COMPREPLY=($(compgen -W "--continue --abort --yes" -- "$cur"))
       else
         _grov_complete_stack_scope
       fi
@@ -241,7 +249,7 @@ _grov() {
       ;;
     remove)
       if [[ $cword -eq 2 && "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "--yes --cascade" -- "$cur"))
+        COMPREPLY=($(compgen -W "--yes" -- "$cur"))
       else
         _grov_complete_stack_scope
       fi

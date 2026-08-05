@@ -760,7 +760,7 @@ class App:
         r = self.current()
         if not r: return
         target = r.head if r.kind == "orphan" else r.name
-        self.run_grov(["push", "--from", target, "--yes"], confirm=f"Push subtree from {target}?")
+        self.run_grov(["push", f"{target}::", "--yes"], confirm=f"Push {target}:: (upstack)?")
 
     def act_restack(self):
         in_prog = [wt for wt in self.state.worktrees.values() if wt.rebasing]
@@ -769,12 +769,18 @@ class App:
             if choice == "continue": self.run_grov(["restack", "--continue"])
             elif choice == "abort": self.run_grov(["restack", "--abort"])
             return
-        self.run_grov(["restack"])
+        r = self.current()
+        if not r:
+            self.run_grov(["restack"])
+            return
+        target = r.head if r.kind == "orphan" else r.name
+        self.run_grov(["restack", f"{target}::"], confirm=f"Restack {target}:: ?")
 
     def act_remove(self):
         r = self.current()
         if not r or not r.folder: return
-        self.run_grov(["remove", r.folder], confirm=f"Remove worktree {r.folder}?")
+        target = r.head if r.kind == "orphan" else r.name
+        self.run_grov(["remove", target], confirm=f"Remove {target}?")
 
     def act_base(self):
         r = self.current()
@@ -815,8 +821,8 @@ class App:
             "  C              checkout existing branch by name (prompt)",
             "  n              new branch off linked (grov checkout -b)",
             "  p              reparent selected (pick new parent)",
-            "  P              push subtree from selected",
-            "  r              restack (or continue/abort if rebasing)",
+            "  P              push selected:: (upstack)",
+            "  r              restack selected:: (or continue/abort if rebasing)",
             "  d              remove selected worktree",
             "  b              set selected as base",
             "  f              git fetch --all",

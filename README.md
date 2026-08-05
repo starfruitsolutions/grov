@@ -30,7 +30,7 @@ grov init                 # convert existing repo into the grov layout
 grov checkout -b feature  # create branch, worktree, point workspace at it
 cd workspace              # primary dev tree
 # ...edit, git add, git commit...
-grov push --all           # push every pushable branch (no prompt)
+grov push --yes ::        # push every stacked branch (no prompt)
 ```
 
 ## Mounts vs work vs checkout
@@ -48,25 +48,31 @@ grov push --all           # push every pushable branch (no prompt)
 
 ## Bulk scopes (`push`, `pull`, `restack`, `remove`)
 
-Shared targeting rules:
+Shared stack specs (orphans are never implied — name them explicitly):
 
-| Invocation | `push` / `pull` / `restack` | `remove` |
-|------------|---------------------------|----------|
-| *(no branch)* | All pushable / all pullable / all stack rebases; **prompt** | *(not allowed)* |
-| `--all` or `--yes` | Same scope; **no prompt** | `--yes` only (no `--all`) |
-| `<branch>` | **That branch only** | **That branch only** (fails if stack children) |
-| `<branch> --cascade` | Branch + stack **descendants** (parent-before-child) | Branch + descendants (**leaves first**) |
-| `<from>..<to>` | Stack chain (from exclusive → to inclusive) | Same chain (**leaves first**) |
-| `--cascade` *(no branch)* | Descendants from **workspace** mount branch | — |
+| Spec | Meaning |
+|------|---------|
+| *(omitted)* | Current workspace branch (`@`) — **not** allowed for `remove` |
+| `@` | Current workspace branch |
+| `<branch>` | That branch only |
+| `<a>..<b>` | Stack chain from `a` exclusive → `b` inclusive |
+| `<branch>::` | Branch + upstack (descendants) |
+| `::<branch>` | Downstack through branch (ancestors, inclusive) |
+| `::` | Entire stack forest (`stack.json` only) |
+
+Order: parent-before-child for `push` / `pull` / `restack`; leaves-first for `remove`.  
+Confirm with a prompt unless `--yes` / `-y`. `push` / `pull` also support `--dry-run`.
 
 Examples:
 
 ```bash
-grov push interface-improvements --cascade    # push subtree
-grov push interface-improvements              # push only that branch
+grov push                         # workspace branch only
+grov push @::                     # workspace + upstack
+grov push interface-improvements::
+grov push interface-improvements  # that branch only
 grov pull stacked-diffs..interactive-interface
-grov restack stacked-diffs..interactive-interface
-grov remove interface-improvements --cascade  # tear down subtree
+grov restack ::                   # restack whole stack
+grov remove interface-improvements::
 ```
 
 `--continue` / `--abort` on `restack` apply to an in-progress rebase only.
@@ -80,13 +86,13 @@ grov remove interface-improvements --cascade  # tear down subtree
 | `switch <branch>` | Repoint **`workspace`** mount only |
 | `add [-b] <branch>` | Create a worktree without changing mounts |
 | `status` | Worktrees, stack tree, mounts, git state |
-| `remove [--yes] <branch>\|<a>..<b> [--cascade]` | Remove worktree(s); blocks **workspace** mount |
-| `restack [--all] [--yes] [--continue\|--abort] [[branch\|<a>..<b>] [--cascade]]` | Rebase onto parents |
-| `push [--all] [--yes] [--dry-run] [[branch\|<a>..<b>] [--cascade]]` | Push with `--force-with-lease` |
-| `pull [--all] [--yes] [--dry-run] [[branch\|<a>..<b>] [--cascade]]` | `git pull` from upstream (parent-before-child) |
+| `remove [--yes] <spec>` | Remove worktree(s); blocks **workspace** mount |
+| `restack [--yes] [--continue\|--abort] [<spec>]` | Rebase onto parents (default: `@`) |
+| `push [--yes] [--dry-run] [<spec>]` | Push with `--force-with-lease` (default: `@`) |
+| `pull [--yes] [--dry-run] [<spec>]` | `git pull` from upstream (default: `@`) |
 | `parent <child> [parent] [--yes] [--no-rebase]` | Add/move a branch in the stack |
 | `base [<branch>]` | Show or set the global base (trunk) branch |
-| `stack remove <branch>` | Same as `grov remove` (supports cascade/range) |
+| `stack remove <branch>` | Same as `grov remove` (supports stack specs) |
 | `stack doctor` | Validate `stack.json` vs actual worktrees |
 | `mount <name> <branch>` | Add optional mount symlink at repo root |
 | `unmount <name>` | Remove optional mount (`workspace` is required) |
