@@ -9,7 +9,7 @@
 #   add [-b] <branch>       create worktree only (no link change)
 #   status [--no-fetch]     list worktrees, stack tree, linked branch, git state (fetches by default)
 #   remove <branch>         remove a worktree (stack leaf only if branch is in stack)
-#   restack [--yes] [--continue|--abort] [<spec>]   rebase onto parents (default: @)
+#   restack [--yes] [--dry-run] [--continue|--abort] [<spec>]   rebase onto parents (default: @)
 #   push [--yes] [--dry-run] [<spec>]   push with --force-with-lease (default: @)
 #   pull [--yes] [--dry-run] [<spec>]   git pull upstream (default: @)
 #   remove [--yes] <spec>   remove worktree(s); spec required
@@ -565,7 +565,7 @@ usage() {
   echo "  add [-b] <branch>        create worktree only (no link change)"
   echo "  status [--no-fetch]      list worktrees, stack tree, git state (fetches by default)"
   echo "  remove [--yes] <spec>        remove worktree(s); spec required"
-  echo "  restack [--yes] [--continue|--abort] [<spec>]   (default: @)"
+  echo "  restack [--yes] [--dry-run] [--continue|--abort] [<spec>]   (default: @)"
   echo "  push [--yes] [--dry-run] [<spec>]   (default: @)"
   echo "  pull [--yes] [--dry-run] [<spec>]   (default: @)"
   echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::"
@@ -1549,7 +1549,7 @@ cmd_restack() {
   stack_ensure_file "$root"
   require_python3
   stack_scope_parse_args "$root" "$@" || {
-    echo "Usage: grov restack [--yes] [--continue|--abort] [<spec>]" >&2
+    echo "Usage: grov restack [--yes] [--dry-run] [--continue|--abort] [<spec>]" >&2
     echo "  specs: @ | <branch> | <a>..<b> | <branch>:: | ::<branch> | ::" >&2
     exit 1
   }
@@ -1577,6 +1577,14 @@ cmd_restack() {
     IFS=$'\t' read -r child parent <<<"$line"
     echo "  $child onto $parent"
   done
+
+  if [[ "$SCR_DRY" == true ]]; then
+    for line in "${mapfile_order[@]}"; do
+      IFS=$'\t' read -r child parent <<<"$line"
+      echo "    dry-run: git rebase $parent   (in branch $child)"
+    done
+    return 0
+  fi
 
   if [[ "$SCR_YES" != true ]]; then
     echo -n "Restack ${#mapfile_order[@]} branch(es)? [y/N] "

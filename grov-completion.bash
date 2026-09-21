@@ -190,7 +190,7 @@ _grov() {
     status) ;;
     restack)
       if [[ $cword -eq 2 && "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "--continue --abort --yes" -- "$cur"))
+        COMPREPLY=($(compgen -W "--continue --abort --yes --dry-run" -- "$cur"))
       else
         _grov_complete_stack_scope
       fi
