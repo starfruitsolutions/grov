@@ -1657,38 +1657,33 @@ root, start = sys.argv[1:3]
 with open(os.path.join(root, ".grov", "stack.json")) as f:
     nodes = json.load(f).get("nodes") or {}
 
-if start not in nodes:
-    print(start)
-    sys.exit(0)
-
 children = collections.defaultdict(list)
 for b, m in nodes.items():
     p = m.get("parent")
     if p:
         children[p].append(b)
 
+# The base/trunk branch is not a node in stack.json, but it can still parent
+# stacked branches, so walk children even when <start> itself is not a node.
+if start not in nodes and start not in children:
+    print(start)
+    sys.exit(0)
+
 seen = set()
+level = {start: 0}
 q = collections.deque([start])
-out = []
 while q:
     b = q.popleft()
     if b in seen:
         continue
     seen.add(b)
-    out.append(b)
     for c in sorted(children.get(b, [])):
+        if c not in level:
+            level[c] = level[b] + 1
         q.append(c)
 
-def depth(b):
-    if b not in nodes:
-        return 0
-    p = nodes[b].get("parent")
-    if not p or p not in nodes:
-        return 0
-    return 1 + depth(p)
-
-# push parents before children => smaller depth first
-for b in sorted(seen, key=lambda x: (depth(x), x)):
+# parents before children
+for b in sorted(seen, key=lambda x: (level[x], x)):
     print(b)
 PY
 }
