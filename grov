@@ -728,6 +728,11 @@ cmd_init() {
       [[ -n "$refspec" ]] && git --git-dir="$bare_tmp" config --add "remote.$name.fetch" "$refspec"
     done
   done < <(git -C "$root" remote 2>/dev/null)
+  # Keep each branch's upstream (branch.<name>.remote/merge etc.)
+  local key value
+  while IFS=' ' read -r key value; do
+    [[ -n "$key" ]] && git --git-dir="$bare_tmp" config --add "$key" "$value"
+  done < <(git -C "$root" config --get-regexp '^branch\.' 2>/dev/null)
   if ! git --git-dir="$bare_tmp" rev-parse --verify "$branch" &>/dev/null; then
     echo "Error: Branch '$branch' not in bare repo (push may have failed)." >&2
     exit 1
@@ -1244,6 +1249,10 @@ stack_roots = sorted(
 )
 trunks_seen = set()
 trunks = []
+# The base is always the root of the stack, even before anything is stacked on it
+if base and base not in stack_branches:
+    trunks.append(base)
+    trunks_seen.add(base)
 for rt in stack_roots:
     par = nodes[rt].get("parent") or ""
     if par and par not in trunks_seen:
@@ -1477,7 +1486,7 @@ if other_conflicts:
 items.append(("blank",))
 
 items.append(("section", "Stack"))
-if not nodes:
+if not nodes and not trunks:
     items.append(("dim", f"{INDENT}(empty)"))
 else:
     for trunk in trunks:

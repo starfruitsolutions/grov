@@ -211,6 +211,10 @@ def load_state(root: str) -> State:
     stack_roots = sorted([b for b, n in nodes.items() if (n.parent or "") not in stack_branches])
     trunks: list = []
     seen_trunks: set = set()
+    # The base is always the root of the stack, even before anything is stacked on it
+    if base and base not in stack_branches:
+        trunks.append(base)
+        seen_trunks.add(base)
     for rt in stack_roots:
         par = nodes[rt].parent or ""
         if par and par not in seen_trunks:
