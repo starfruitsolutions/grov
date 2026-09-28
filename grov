@@ -1391,6 +1391,7 @@ def fmt_row(name, prefix, is_orphan, parent_name=None):
     return left, right
 
 INDENT = "  "
+ARROW = "\u2192"
 
 def render(name, prefix_for_this, prefix_for_kids, parent_name=None):
     left, right = fmt_row(name, prefix_for_this, is_orphan=False, parent_name=parent_name)
@@ -1467,7 +1468,7 @@ else:
                     line_extra = " " + c(ORANGE, st)
             except Exception:
                 pass
-        items.append(("text", f"{INDENT}{name_disp} {c(DIM, '\u2192')} {conn}{suffix}{line_extra}"))
+        items.append(("text", f"{INDENT}{name_disp} {c(DIM, ARROW)} {conn}{suffix}{line_extra}"))
 
 conflicts = branches_in_conflict()
 other_conflicts = [b for b in conflicts if b != linked_branch]
