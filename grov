@@ -700,50 +700,45 @@ cmd_init() {
     echo "Error: Already a grov project (.grov exists)." >&2
     exit 1
   fi
+  if [[ ! -d "$root/.git" || "$(git rev-parse --absolute-git-dir)" != "$root/.git" ]]; then
+    echo "Error: grov init needs a regular repo with its own .git directory (not a worktree or submodule)." >&2
+    exit 1
+  fi
+  local op
+  for op in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "$root/.git/$op" ]]; then
+      echo "Error: A merge/rebase/cherry-pick is in progress. Finish or abort it before grov init." >&2
+      exit 1
+    fi
+  done
   local branch
-  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="rescue"
-  [[ "$branch" == "HEAD" || -z "$branch" ]] && branch="rescue"
+  branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || branch=""
+  if [[ -z "$branch" ]]; then
+    # Detached HEAD: keep it on a branch so it can live in a worktree
+    branch="rescue"
+    git branch "$branch" HEAD || exit 1
+    git symbolic-ref HEAD "refs/heads/$branch"
+  fi
   local branch_dir="${branch//[^a-zA-Z0-9._-]/_}"
   mkdir -p .grov/scripts
   echo "$branch_dir" > .grov/primary-dir
   echo "$branch" > .grov/primary-branch
-  # Remember what was staged; the new worktree's index is rebuilt from HEAD.
-  local staged_patch="$root/.grov/init-staged.patch"
-  git diff --cached --binary >"$staged_patch"
-  # Build the bare repo aside, then swap it in as <root>/.git once the old one is gone.
-  local bare_tmp="$root/.grov/repo-init.git"
-  git init --bare --quiet "$bare_tmp"
-  git --git-dir="$bare_tmp" symbolic-ref HEAD "refs/heads/$branch"
-  git --git-dir="$bare_tmp" config rerere.enabled true
-  git --git-dir="$bare_tmp" config rerere.autoupdate true
-  # HEAD:$branch also covers a detached HEAD (branch "rescue")
-  (cd "$root" && git remote add _dev_bare "$bare_tmp" && git push _dev_bare --all && git push _dev_bare "HEAD:refs/heads/$branch" && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
-  # Copy remotes from original repo into bare so fetch/push still work
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
-    url=$(git -C "$root" config --get "remote.$name.url" 2>/dev/null)
-    [[ -z "$url" ]] && continue
-    git --git-dir="$bare_tmp" remote add "$name" "$url" 2>/dev/null || true
-    git -C "$root" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
-      [[ -n "$refspec" ]] && git --git-dir="$bare_tmp" config --add "remote.$name.fetch" "$refspec"
-    done
-  done < <(git -C "$root" remote 2>/dev/null)
-  # Keep each branch's upstream (branch.<name>.remote/merge etc.)
-  local key value
-  while IFS=' ' read -r key value; do
-    [[ -n "$key" ]] && git --git-dir="$bare_tmp" config --add "$key" "$value"
-  done < <(git -C "$root" config --get-regexp '^branch\.' 2>/dev/null)
-  if ! git --git-dir="$bare_tmp" rev-parse --verify "$branch" &>/dev/null; then
-    echo "Error: Branch '$branch' not in bare repo (push may have failed)." >&2
-    exit 1
-  fi
-  rm -rf "$root/.git"
-  mv "$bare_tmp" "$root/$BARE_REPO" || { echo "Error: Failed to move bare repo into place." >&2; exit 1; }
+  # Convert the existing .git to bare in place, so branches, upstreams, remote refs, stashes,
+  # reflogs, hooks and config all carry over untouched.
+  local git_dir="$root/$BARE_REPO"
+  git config core.bare true
+  git --git-dir="$git_dir" config rerere.enabled true
+  git --git-dir="$git_dir" config rerere.autoupdate true
+  local old_index="$root/.grov/init-index"
+  [[ -f "$git_dir/index" ]] && mv "$git_dir/index" "$old_index"
   mkdir -p "$BRANCHES_DIR_NAME"
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch_dir
-  git --git-dir="$root/$BARE_REPO" worktree add --no-checkout "$wt_path" "$branch" || {
-    echo "Error: Failed to create worktree; your files are still at $root." >&2
+  git --git-dir="$git_dir" worktree add --no-checkout "$wt_path" "$branch" || {
+    git --git-dir="$git_dir" config core.bare false
+    [[ -f "$old_index" ]] && mv "$old_index" "$git_dir/index"
+    rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME"
+    echo "Error: Failed to create worktree; the repo was left as it was." >&2
     exit 1
   }
   # Move the working tree (edits, untracked and ignored files included) into the new worktree as-is
@@ -753,12 +748,12 @@ cmd_init() {
     case "${f##*/}" in .git|.grov|"$BRANCHES_DIR_NAME") continue ;; esac
     mv "$f" "$wt_path/"
   done
-  git -C "$wt_path" reset --quiet
-  if [[ -s "$staged_patch" ]]; then
-    git -C "$wt_path" apply --cached --binary "$staged_patch" ||
-      echo "Warning: Could not restore staged changes; they are unstaged in branches/$branch_dir." >&2
+  # Reuse the old index so staged changes stay staged
+  if [[ -f "$old_index" ]]; then
+    mv "$old_index" "$(git -C "$wt_path" rev-parse --absolute-git-dir)/index"
+  else
+    git -C "$wt_path" reset --quiet
   fi
-  rm -f "$staged_patch"
   printf '%s\n' "{\"version\":1,\"mounts\":{\"$WORKSPACE_MOUNT\":\"$branch_dir\"}}" >"$root/$MOUNTS_JSON"
   apply_mount_symlink "$root" "$WORKSPACE_MOUNT" "$branch_dir"
   printf '%s\n' '{"version":1,"nodes":{}}' >"$root/$STACK_JSON"
@@ -2607,47 +2602,48 @@ cmd_restore() {
   local linked_branch
   linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
   [[ -z "$linked_branch" ]] && linked_branch="${primary_branch:-master}"
-  local tmp="$root/.grov-restore-tmp"
-  git clone --local "$(bare_path "$root")" "$tmp" -b "$linked_branch" || {
-    echo "Error: Clone from bare failed." >&2
+  # The worktree's files land next to .grov and branches/ until those are removed
+  if [[ -e "$linked_wt/.grov" || -e "$linked_wt/$BRANCHES_DIR_NAME" ]]; then
+    echo "Error: $linked_wt contains .grov or $BRANCHES_DIR_NAME; move it aside before grov restore." >&2
     exit 1
-  }
-  local bare="$(bare_path "$root")"
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
-    url=$(git --git-dir="$bare" config --get "remote.$name.url" 2>/dev/null)
-    [[ -z "$url" ]] && continue
-    if [[ "$name" == "origin" ]]; then
-      git -C "$tmp" remote set-url origin "$url"
-    else
-      git -C "$tmp" remote add "$name" "$url" 2>/dev/null || git -C "$tmp" remote set-url "$name" "$url"
-      git --git-dir="$bare" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
-        [[ -n "$refspec" ]] && git -C "$tmp" config --add "remote.$name.fetch" "$refspec"
-      done
-    fi
-  done < <(git --git-dir="$bare" remote 2>/dev/null)
-  cd /tmp 2>/dev/null || cd "$root/.." || true
+  fi
+  local head_sha
+  head_sha=$(git -C "$linked_wt" rev-parse HEAD) || { echo "Error: Could not read HEAD of $linked_wt." >&2; exit 1; }
+  # Turn the existing bare repo back into a normal .git in place, so every branch, upstream,
+  # remote ref, stash and reflog survives.
+  local bare
+  bare=$(bare_path "$root")
+  if [[ "$bare" != "$root/$BARE_REPO" ]]; then
+    mv "$bare" "$root/$BARE_REPO" || { echo "Error: Failed to move $bare to $root/$BARE_REPO." >&2; exit 1; }
+  fi
+  cd "$root" || exit 1
   mounts_ensure_file "$root" 2>/dev/null || true
   local mname
   while IFS= read -r mname; do
     [[ -z "$mname" ]] && continue
-    [[ -L "$root/$mname" || -e "$root/$mname" ]] && rm -f "$root/$mname"
+    [[ -L "$root/$mname" ]] && rm -f "$root/$mname"
   done < <(mounts_list_names "$root" 2>/dev/null || true)
-  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME" || {
-    echo "Error: Failed to remove .grov or branches." >&2
-    rm -rf "$tmp"
-    exit 1
-  }
-  for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
-    [[ -e "$f" && "$f" != "$tmp" ]] && rm -rf "$f"
+  # Move the linked worktree's files (ignored ones included) up to the root as-is
+  local f
+  for f in "$linked_wt"/* "$linked_wt"/.[!.]* "$linked_wt"/..?*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ "${f##*/}" == .git ]] && continue
+    mv "$f" "$root/"
   done
-  mv "$tmp/.git" "$root/.git"
-  (cd "$tmp" && shopt -s dotglob nullglob 2>/dev/null; for f in *; do
-    [[ -z "$f" || "$f" == ".git" ]] && continue
-    [[ -e "$f" ]] && mv "$f" "$root/$f"
-  done)
-  rm -rf "$tmp"
-  echo "Restored to normal git repo (branch $linked_branch at root)."
+  rm -rf "$root/.grov" "$root/$BRANCHES_DIR_NAME"
+  git --git-dir="$root/$BARE_REPO" worktree prune
+  git --git-dir="$root/$BARE_REPO" config core.bare false
+  if [[ "$linked_branch" == "HEAD" ]]; then
+    git -C "$root" update-ref --no-deref HEAD "$head_sha"
+  else
+    git -C "$root" symbolic-ref HEAD "refs/heads/$linked_branch"
+  fi
+  git -C "$root" reset --quiet
+  if [[ "$linked_branch" == "HEAD" ]]; then
+    echo "Restored to normal git repo (detached HEAD at root)."
+  else
+    echo "Restored to normal git repo (branch $linked_branch at root)."
+  fi
 }
 
 # Main: init does not require grov root
