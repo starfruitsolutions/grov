@@ -3,7 +3,7 @@
 #
 # Install: run ./install from this repo (or ln -sf path/to/grov/grov ~/bin/grov).
 # Usage: grov <command> [args...]
-#   init                    convert current git repo to dev layout (bare at .grov/repo.git)
+#   init                    convert current git repo to dev layout (bare at .git)
 #   checkout [-b] <branch>  ensure worktree exists, point workspace at it
 #   switch <branch>         point workspace at existing worktree only
 #   add [-b] <branch>       create worktree only (no link change)
@@ -36,7 +36,8 @@ set -e
 LINK_NAME="workspace"
 WORKSPACE_MOUNT="workspace"
 BRANCHES_DIR_NAME="branches"
-BARE_REPO=".grov/repo.git"
+BARE_REPO=".git"
+LEGACY_BARE_REPO=".grov/repo.git"
 STACK_JSON=".grov/stack.json"
 MOUNTS_JSON=".grov/mounts.json"
 
@@ -582,16 +583,21 @@ usage() {
   echo "  interactive              launch curses TUI dashboard"
   echo "  root | branch | branches | path | scripts"
   echo "  run <name> [args...]     run .grov/scripts/<name>"
-  exit 1
+  exit "${1:-1}"
 }
 
-has_bare() { [[ -d "$1/$BARE_REPO" ]]; }
+# Bare repo lives at <root>/.git; older projects keep it at .grov/repo.git.
+bare_path() {
+  if [[ -d "$1/$LEGACY_BARE_REPO" ]]; then echo "$1/$LEGACY_BARE_REPO"; else echo "$1/$BARE_REPO"; fi
+}
+
+has_bare() { [[ -d "$(bare_path "$1")" ]]; }
 
 # Resolve branch to a ref (local branch name or origin/branch). Echoes ref and returns 0 if found, else return 1.
 resolve_branch_ref() {
   local root=$1
   local branch=$2
-  local bare="$root/$BARE_REPO"
+  local bare="$(bare_path "$root")"
   if has_bare "$root"; then
     if git --git-dir="$bare" rev-parse --verify "$branch" &>/dev/null; then
       echo "$branch"; return 0
@@ -622,7 +628,7 @@ ensure_worktree() {
   local branch=$3
   local wt_path
   wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch
-  local bare="$root/$BARE_REPO"
+  local bare="$(bare_path "$root")"
   if has_bare "$root"; then
     if [[ ! -d "$wt_path" ]]; then
       if [[ "$create_branch" == true ]]; then
@@ -653,7 +659,7 @@ ensure_worktree() {
     primary_dir=$(get_primary_dir "$root")
     local repo="$root/$BRANCHES_DIR_NAME/$primary_dir"
     if [[ ! -d "$repo/.git" ]]; then
-      echo "Error: No .grov/repo.git and no primary worktree at $repo. Run grov init first." >&2
+      echo "Error: No bare repo and no primary worktree at $repo. Run grov init first." >&2
       exit 1
     fi
     if [[ -d "$wt_path" ]]; then
@@ -698,44 +704,61 @@ cmd_init() {
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="rescue"
   [[ "$branch" == "HEAD" || -z "$branch" ]] && branch="rescue"
   local branch_dir="${branch//[^a-zA-Z0-9._-]/_}"
-  mkdir -p .grov/scripts .grov/old-checkout
+  mkdir -p .grov/scripts
   echo "$branch_dir" > .grov/primary-dir
   echo "$branch" > .grov/primary-branch
-  # Move untracked out first so we don't overwrite them when creating worktree at branches/
-  (cd "$root" && git ls-files --others --exclude-standard) | while IFS= read -r f; do
-    [[ -n "$f" && -e "$root/$f" ]] || continue
-    mkdir -p "$root/.grov/old-checkout/$(dirname "$f")"
-    mv "$root/$f" "$root/.grov/old-checkout/$f"
-  done
-  git init --bare "$BARE_REPO"
-  git --git-dir="$root/$BARE_REPO" config rerere.enabled true
-  git --git-dir="$root/$BARE_REPO" config rerere.autoupdate true
-  (cd "$root" && git remote add _dev_bare "$(pwd)/$BARE_REPO" && git push _dev_bare --all && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
+  # Remember what was staged; the new worktree's index is rebuilt from HEAD.
+  local staged_patch="$root/.grov/init-staged.patch"
+  git diff --cached --binary >"$staged_patch"
+  # Build the bare repo aside, then swap it in as <root>/.git once the old one is gone.
+  local bare_tmp="$root/.grov/repo-init.git"
+  git init --bare --quiet "$bare_tmp"
+  git --git-dir="$bare_tmp" symbolic-ref HEAD "refs/heads/$branch"
+  git --git-dir="$bare_tmp" config rerere.enabled true
+  git --git-dir="$bare_tmp" config rerere.autoupdate true
+  # HEAD:$branch also covers a detached HEAD (branch "rescue")
+  (cd "$root" && git remote add _dev_bare "$bare_tmp" && git push _dev_bare --all && git push _dev_bare "HEAD:refs/heads/$branch" && git push _dev_bare --tags 2>/dev/null; git remote remove _dev_bare 2>/dev/null)
   # Copy remotes from original repo into bare so fetch/push still work
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     url=$(git -C "$root" config --get "remote.$name.url" 2>/dev/null)
     [[ -z "$url" ]] && continue
-    git --git-dir="$root/$BARE_REPO" remote add "$name" "$url" 2>/dev/null || true
+    git --git-dir="$bare_tmp" remote add "$name" "$url" 2>/dev/null || true
     git -C "$root" config --get-all "remote.$name.fetch" 2>/dev/null | while IFS= read -r refspec; do
-      [[ -n "$refspec" ]] && git --git-dir="$root/$BARE_REPO" config --add "remote.$name.fetch" "$refspec"
+      [[ -n "$refspec" ]] && git --git-dir="$bare_tmp" config --add "remote.$name.fetch" "$refspec"
     done
   done < <(git -C "$root" remote 2>/dev/null)
-  mkdir -p "$BRANCHES_DIR_NAME"
-  local wt_path
-  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch_dir
-  if ! git --git-dir="$root/$BARE_REPO" rev-parse --verify "$branch" &>/dev/null; then
+  if ! git --git-dir="$bare_tmp" rev-parse --verify "$branch" &>/dev/null; then
     echo "Error: Branch '$branch' not in bare repo (push may have failed)." >&2
     exit 1
   fi
-  git --git-dir="$root/$BARE_REPO" worktree add "$wt_path" "$branch"
+  rm -rf "$root/.git"
+  mv "$bare_tmp" "$root/$BARE_REPO" || { echo "Error: Failed to move bare repo into place." >&2; exit 1; }
+  mkdir -p "$BRANCHES_DIR_NAME"
+  local wt_path
+  wt_path=$(cd "$root" && pwd)/$BRANCHES_DIR_NAME/$branch_dir
+  git --git-dir="$root/$BARE_REPO" worktree add --no-checkout "$wt_path" "$branch" || {
+    echo "Error: Failed to create worktree; your files are still at $root." >&2
+    exit 1
+  }
+  # Move the working tree (edits, untracked and ignored files included) into the new worktree as-is
+  local f
+  for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    case "${f##*/}" in .git|.grov|"$BRANCHES_DIR_NAME") continue ;; esac
+    mv "$f" "$wt_path/"
+  done
+  git -C "$wt_path" reset --quiet
+  if [[ -s "$staged_patch" ]]; then
+    git -C "$wt_path" apply --cached --binary "$staged_patch" ||
+      echo "Warning: Could not restore staged changes; they are unstaged in branches/$branch_dir." >&2
+  fi
+  rm -f "$staged_patch"
   printf '%s\n' "{\"version\":1,\"mounts\":{\"$WORKSPACE_MOUNT\":\"$branch_dir\"}}" >"$root/$MOUNTS_JSON"
   apply_mount_symlink "$root" "$WORKSPACE_MOUNT" "$branch_dir"
-  find "$root" -mindepth 1 -maxdepth 1 ! -name .grov ! -name "$BRANCHES_DIR_NAME" ! -name "$LINK_NAME" ! -name .git -exec rm -rf {} +
-  rm -rf "$root/.git"
   printf '%s\n' '{"version":1,"nodes":{}}' >"$root/$STACK_JSON"
-  echo "Untracked files from previous working tree. Refs in .grov/repo.git; worktree at branches/$branch_dir" > "$root/.grov/old-checkout/README.txt"
-  echo "Initialized. workspace -> branches/$branch_dir. Untracked files in .grov/old-checkout."
+  stack_set_base "$root" "$branch"
+  echo "Initialized. workspace -> branches/$branch_dir, base '$branch' (working tree changes carried over)."
 }
 
 cmd_root() {
@@ -905,7 +928,7 @@ remove_one_branch() {
     return 1
   fi
   if has_bare "$root"; then
-    git --git-dir="$root/$BARE_REPO" worktree remove "$wt_path"
+    git --git-dir="$(bare_path "$root")" worktree remove "$wt_path"
   else
     local primary_dir
     primary_dir=$(get_primary_dir "$root")
@@ -1023,7 +1046,7 @@ cmd_status() {
   require_python3
   if [[ "$do_fetch" == true && -z "$GROV_NO_FETCH" ]]; then
     if has_bare "$root"; then
-      git --git-dir="$root/$BARE_REPO" fetch --all --quiet 2>/dev/null || true
+      git --git-dir="$(bare_path "$root")" fetch --all --quiet 2>/dev/null || true
     else
       local primary_dir
       primary_dir=$(get_primary_dir "$root")
@@ -2549,8 +2572,18 @@ PY
 
 cmd_restore() {
   local root=$1
-  if [[ ! -d "$root/$BARE_REPO" ]]; then
+  if [[ ! -d "$(bare_path "$root")" ]]; then
     echo "Error: Not a grov project (no $BARE_REPO)." >&2
+    exit 1
+  fi
+  # Restore rebuilds from commits only, so refuse while any worktree has unsaved work
+  local wt dirty=()
+  for wt in "$root/$BRANCHES_DIR_NAME"/*/; do
+    [[ -e "$wt/.git" ]] || continue
+    [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]] && dirty+=("$(basename "$wt")")
+  done
+  if (( ${#dirty[@]} )); then
+    echo "Error: Uncommitted changes in: ${dirty[*]}. Commit or stash them before grov restore." >&2
     exit 1
   fi
   ensure_workspace "$root" || { echo "Error: No workspace linked." >&2; exit 1; }
@@ -2565,11 +2598,11 @@ cmd_restore() {
   linked_branch=$(git -C "$linked_wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
   [[ -z "$linked_branch" ]] && linked_branch="${primary_branch:-master}"
   local tmp="$root/.grov-restore-tmp"
-  git clone --local "$root/$BARE_REPO" "$tmp" -b "$linked_branch" || {
+  git clone --local "$(bare_path "$root")" "$tmp" -b "$linked_branch" || {
     echo "Error: Clone from bare failed." >&2
     exit 1
   }
-  local bare="$root/$BARE_REPO"
+  local bare="$(bare_path "$root")"
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     url=$(git --git-dir="$bare" config --get "remote.$name.url" 2>/dev/null)
@@ -2614,6 +2647,11 @@ if [[ "$cmd" == "init" ]]; then
   cmd_init
   exit 0
 fi
+# Help needs no grov root either
+case "$cmd" in
+  "") usage ;;
+  help|-h|--help) usage 0 ;;
+esac
 
 _raw_root=$(find_dev_root) || {
   echo "Error: Cannot find grov root (no .grov in path and GROV_ROOT not set)." >&2

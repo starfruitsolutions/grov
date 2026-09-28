@@ -49,7 +49,12 @@ if [[ -f "$COMPLETION" ]]; then
       echo "" >> "$BASHRC"
       echo "# grov completion" >> "$BASHRC"
       echo "source $COMPLETION" >> "$BASHRC"
+      echo "Added completion to $BASHRC."
     }
+  else
+    echo "Note: no $BASHRC; to enable completion add: source $COMPLETION"
   fi
-  source "$COMPLETION"
 fi
+
+# ./install runs in a child shell, so PATH and completion changes can't reach the calling shell.
+echo "Done. Run 'source $BASHRC' (or open a new terminal) to pick up PATH and completion."

@@ -789,7 +789,9 @@ class App:
         self.run_grov(["base", target], confirm=f"Set base to {target}?")
 
     def act_fetch(self):
-        bare = os.path.join(self.root, ".grov", "repo.git")
+        bare = os.path.join(self.root, ".grov", "repo.git")  # legacy location
+        if not os.path.isdir(bare):
+            bare = os.path.join(self.root, ".git")
         if os.path.isdir(bare):
             self.exec_argv(["git", f"--git-dir={bare}", "fetch", "--all"])
             return

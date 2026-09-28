@@ -6,7 +6,7 @@ A bash CLI for working in **git worktrees** with a stable `workspace/` mount, op
 
 Switching branches with `git checkout` blows away your working tree and IDE state. Worktrees fix that, but managing a bunch of them by hand is annoying. `grov` lays out a project so:
 
-- The bare repo lives at `.grov/repo.git`
+- The bare repo lives at `.git` in the project root (so tools that look for `.git` find it)
 - Every branch you touch becomes a worktree under `branches/<name>/`
 - A required **`workspace`** mount points at your primary dev tree (IDE-friendly)
 - Optional **named mounts** (e.g. `dock/`) point at other worktrees without moving `workspace`
@@ -81,7 +81,7 @@ grov remove interface-improvements::
 
 | Command | What it does |
 |---|---|
-| `init` | Convert current git repo into the grov layout (bare at `.grov/repo.git`) |
+| `init` | Convert current git repo into the grov layout (bare at `.git`) |
 | `checkout [-b] <branch>` | Ensure worktree exists, repoint **`workspace`** mount |
 | `switch <branch>` | Repoint **`workspace`** mount only |
 | `add [-b] <branch>` | Create a worktree without changing mounts |
@@ -115,8 +115,8 @@ A curses dashboard showing all worktrees, the stack tree, dirty/ahead/behind sta
 
 ```
 your-project/
+├── .git/                 # bare repository
 ├── .grov/
-│   ├── repo.git/         # bare repository
 │   ├── stack.json        # stacked-branch metadata
 │   ├── mounts.json       # mount name -> worktree folder
 │   └── scripts/          # optional user scripts: grov run <name>
