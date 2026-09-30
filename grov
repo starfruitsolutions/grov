@@ -363,7 +363,7 @@ PY
 # Lines: folder<TAB>head_branch
 scan_worktrees_head() {
   local root=$1
-  local dir wt_path head
+  local dir wt_path head inside
   dir="$root/$BRANCHES_DIR_NAME"
   [[ ! -d "$dir" ]] && return 0
   local d
@@ -371,7 +371,11 @@ scan_worktrees_head() {
     [[ -d "$d" ]] || continue
     wt_path=$(readlink -f "$d" 2>/dev/null || echo "$d")
     [[ ! -d "$wt_path" ]] && continue
-    git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null || continue
+    # Require a local .git; otherwise git walks up into the bare root and
+    # --is-inside-work-tree still exits 0 while printing "false".
+    [[ -e "$wt_path/.git" ]] || continue
+    inside=$(git -C "$wt_path" rev-parse --is-inside-work-tree 2>/dev/null) || continue
+    [[ "$inside" == "true" ]] || continue
     head=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || head="?"
     echo "$(basename "$d")"$'\t'"$head"
   done | sort
@@ -381,7 +385,22 @@ scan_worktrees_head() {
 resolve_worktree_folder() {
   local root=$1
   local git_branch=$2
-  local folder head wt_path gp rb_branch
+  local folder head wt_path gp rb_branch inside
+  # Prefer branches/<branch> when its HEAD matches (avoids picking a leftover
+  # folder that alphabetically sorts first and happens to share HEAD).
+  if [[ -d "$root/$BRANCHES_DIR_NAME/$git_branch" ]]; then
+    wt_path=$(readlink -f "$root/$BRANCHES_DIR_NAME/$git_branch" 2>/dev/null || echo "$root/$BRANCHES_DIR_NAME/$git_branch")
+    if [[ -e "$wt_path/.git" ]]; then
+      inside=$(git -C "$wt_path" rev-parse --is-inside-work-tree 2>/dev/null) || inside=""
+      if [[ "$inside" == "true" ]]; then
+        head=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || head=""
+        if [[ "$head" == "$git_branch" ]]; then
+          echo "$git_branch"
+          return 0
+        fi
+      fi
+    fi
+  fi
   while IFS=$'\t' read -r folder head; do
     [[ "$head" == "$git_branch" ]] && echo "$folder" && return 0
   done < <(scan_worktrees_head "$root")
@@ -390,6 +409,9 @@ resolve_worktree_folder() {
   for d in "$dir"/*/; do
     [[ -d "$d" ]] || continue
     wt_path=$(readlink -f "$d" 2>/dev/null || echo "$d")
+    [[ -e "$wt_path/.git" ]] || continue
+    inside=$(git -C "$wt_path" rev-parse --is-inside-work-tree 2>/dev/null) || continue
+    [[ "$inside" == "true" ]] || continue
     folder=$(basename "$d")
     for sub in rebase-merge rebase-apply; do
       gp=$(git -C "$wt_path" rev-parse --git-path "$sub" 2>/dev/null || true)
@@ -413,7 +435,8 @@ if meta.get("worktree_dir"):
 if br not in candidates:
     candidates.append(br)
 for c in candidates:
-    if os.path.isdir(os.path.join(root, "branches", c)):
+    wt = os.path.join(root, "branches", c)
+    if os.path.isdir(wt) and os.path.exists(os.path.join(wt, ".git")):
         print(c)
         sys.exit(0)
 sys.exit(1)
@@ -1011,7 +1034,9 @@ git_state_line() {
     gp=$(git -C "$wt_path" rev-parse --git-path rebase-apply 2>/dev/null || true)
     [[ -n "$gp" && -d "$gp" ]] && rb=" rebase-in-progress"
   fi
-  if git -C "$wt_path" rev-parse --is-inside-work-tree &>/dev/null; then
+  local inside
+  inside=$(git -C "$wt_path" rev-parse --is-inside-work-tree 2>/dev/null) || inside=""
+  if [[ "$inside" == "true" ]]; then
     if [[ -n $(git -C "$wt_path" status -s 2>/dev/null) ]]; then
       state="uncommitted"
     else
@@ -1195,6 +1220,8 @@ if os.path.isdir(branches_dir):
         if not os.path.isdir(p):
             continue
         wt = os.path.realpath(p)
+        if not os.path.exists(os.path.join(wt, ".git")):
+            continue
         try:
             inside = subprocess.check_output(
                 ["git", "-C", wt, "rev-parse", "--is-inside-work-tree"],
